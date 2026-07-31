@@ -225,6 +225,7 @@ class Drive(pufferlib.PufferEnv):
         self.data_root = data_root
 
         valid_splits = ["training", "validation", "testing", "pufferhard", "testing_with_connectivity", "validation_interactive",
+                        "interactive1k", "random1k",
                         "pufferhard_val_100", "pufferhard_val_1k", "pufferhard_val_10k",
                         "pufferandom_val_100", "pufferandom_val_1k", "pufferandom_val_10k",
                         "pufferinter", "pufferrandom", "nuplan_test14"]

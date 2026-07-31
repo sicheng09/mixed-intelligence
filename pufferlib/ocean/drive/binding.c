@@ -8,6 +8,8 @@
  */
 
 #include <Python.h>
+#include <limits.h>
+#include <stdio.h>
 #include "drive.h"
 #define Env Drive
 #define MY_SHARED
@@ -467,10 +469,17 @@ static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
     // getting env count
     while ((specific_map_id >= 0 && env_count == 0) ||
            (specific_map_id < 0 && (use_all_maps ? map_idx < max_envs : total_agent_count < num_agents && env_count < max_envs))) {
-        char map_file[100];
+        char map_file[PATH_MAX];
         int map_id = (specific_map_id >= 0) ? specific_map_id : (use_all_maps ? map_idx++ : rand() % num_maps);
         Drive* env = calloc(1, sizeof(Drive));
-        sprintf(map_file, "%s/%s/map_%06d.bin", data_root, split, map_id);
+        int path_len = snprintf(map_file, sizeof(map_file), "%s/%s/map_%06d.bin", data_root, split, map_id);
+        if (path_len < 0 || (size_t)path_len >= sizeof(map_file)) {
+            free(env);
+            PyErr_SetString(PyExc_ValueError, "Map path is too long");
+            Py_DECREF(agent_offsets);
+            Py_DECREF(map_ids);
+            return NULL;
+        }
         env->init_mode = init_mode;
         env->control_mode = control_mode;
         env->init_steps = init_steps;
@@ -798,9 +807,13 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         env->idm_default_velocity = (float)unpack(kwargs, "idm_default_velocity");
     }
 
-    char map_file[100];
+    char map_file[PATH_MAX];
     // sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
-    sprintf(map_file, "%s/%s/map_%06d.bin", data_root, split, map_id);
+    int path_len = snprintf(map_file, sizeof(map_file), "%s/%s/map_%06d.bin", data_root, split, map_id);
+    if (path_len < 0 || (size_t)path_len >= sizeof(map_file)) {
+        PyErr_SetString(PyExc_ValueError, "Map path is too long");
+        return -1;
+    }
     env->num_agents = max_agents;
     env->map_name = strdup(map_file);
     env->init_steps = init_steps;
