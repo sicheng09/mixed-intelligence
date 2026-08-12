@@ -144,6 +144,8 @@ class PuffeRL:
         self.importance = torch.ones(segments, horizon, device=device)
         self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
+        # Keep physical rows whose segment-end bootstrap is still pending.
+        self.bootstrap_indices = torch.full((total_agents,), -1, device=device, dtype=torch.int32)
         self.free_idx = total_agents
         self.render = config["render"]
         self.render_interval = config["render_interval"]
@@ -400,6 +402,18 @@ class PuffeRL:
                 # Fast path for fully vectorized envs
                 l = self.ep_lengths[env_id.start].item()
                 batch_rows = slice(self.ep_indices[env_id.start].item(), 1 + self.ep_indices[env_id.stop - 1].item())
+                pending_rows = self.bootstrap_indices[env_id].long()
+                pending_mask = pending_rows >= 0
+                if pending_mask.any():
+                    rows = pending_rows[pending_mask]
+                    if config["cpu_offload"]:
+                        self.observations[rows.cpu(), config["bptt_horizon"]] = o[pending_mask.cpu()]
+                    else:
+                        self.observations[rows, config["bptt_horizon"]] = o_device[pending_mask]
+                    self.rewards[rows, config["bptt_horizon"]] = r[pending_mask]
+                    self.values[rows, config["bptt_horizon"]] = value.flatten()[pending_mask]
+                    pending_rows[pending_mask] = -1
+                    self.bootstrap_indices[env_id] = pending_rows.int()
 
                 if config["cpu_offload"]:
                     self.observations[batch_rows, l] = o
@@ -421,6 +435,12 @@ class PuffeRL:
                 self.ep_lengths[env_id] += 1
                 if l + 1 >= config["bptt_horizon"]:
                     num_full = env_id.stop - env_id.start
+                    self.bootstrap_indices[env_id] = torch.arange(
+                        batch_rows.start,
+                        batch_rows.stop,
+                        device=config["device"],
+                        dtype=torch.int32,
+                    )
                     self.ep_indices[env_id] = self.free_idx + torch.arange(num_full, device=config["device"]).int()
                     self.ep_lengths[env_id] = 0
                     self.free_idx += num_full
@@ -455,14 +475,17 @@ class PuffeRL:
             r = torch.as_tensor(r).to(device)  # , non_blocking=True)
             d = torch.as_tensor(d).to(device)  # , non_blocking=True)
             truncations = torch.as_tensor(truncations).to(device)
-            batch_rows = slice(self.ep_indices[agent_slice.start].item(), 1 + self.ep_indices[agent_slice.stop - 1].item())
+            pending_rows = self.bootstrap_indices[agent_slice].long()
+            pending_mask = pending_rows >= 0
+            if not pending_mask.any():
+                continue
             with torch.no_grad():
                 r = torch.clamp(r, -1, 1)
                 if config["cpu_offload"]:
-                    self.observations[agent_slice, l+1] = o
+                    self.observations[pending_rows[pending_mask].cpu(), config["bptt_horizon"]] = o[pending_mask.cpu()]
                 else:
-                    self.observations[agent_slice, l+1] = o_device
-                self.rewards[agent_slice, l+1] = r
+                    self.observations[pending_rows[pending_mask], config["bptt_horizon"]] = o_device[pending_mask]
+                self.rewards[pending_rows[pending_mask], config["bptt_horizon"]] = r[pending_mask]
 
             with torch.no_grad(), self.amp_context:
                 state = dict(
@@ -476,7 +499,10 @@ class PuffeRL:
                     state["lstm_h"] = self.lstm_h[agent_slice.start]
                     state["lstm_c"] = self.lstm_c[agent_slice.start]
                 _, value = self.policy.forward_eval(o_device, state)
-                self.values[agent_slice, l+1] = value.flatten()
+                value = value.flatten()
+                self.values[pending_rows[pending_mask], config["bptt_horizon"]] = value[pending_mask]
+                pending_rows[pending_mask] = -1
+                self.bootstrap_indices[agent_slice] = pending_rows.int()
 
 
             # if self.full_rows >= self.segments:
@@ -584,6 +610,7 @@ class PuffeRL:
 
         self.free_idx = self.total_agents
         self.ep_indices = torch.arange(self.total_agents, device=device, dtype=torch.int32)
+        self.bootstrap_indices.fill_(-1)
         self.ep_lengths.zero_()
         profile.end()
         return self.stats
