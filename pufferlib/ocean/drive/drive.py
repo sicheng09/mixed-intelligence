@@ -87,6 +87,11 @@ class Drive(pufferlib.PufferEnv):
         expert_fraction=0.0,    # Fraction of agents following expert replay
         idm_target_velocity=15.0,  # Default IDM target velocity [m/s]
         idm_random_velocity=False,  # If True, sample IDM velocity from {10,15,20,30} per agent
+        policy_log_ids=None,    # Stable per-agent-slot policy ids for mix_ppo
+        policy_log_count=0,
+        behavior_conditioning=False,  # Try1 six-dimensional behavior condition
+        behavior_conditioned_policy_id=1,
+        behavior_view_angle_max=180.0,  # Maximum sampled view angle in degrees
         creward_deterministic=False,  # Eval-only: use fixed ego/traffic creward profiles
         emit_jerk_ego_obs=False,  # Force 10-dim jerk ego obs layout even in classic dynamics
         ego_entity_idx=-1,   # Eval-only: entity index of the ego for creward_ego dispatch.
@@ -146,6 +151,15 @@ class Drive(pufferlib.PufferEnv):
         self.ppo_fraction = float(ppo_fraction)
         self.idm_fraction = float(idm_fraction)
         self.expert_fraction = float(expert_fraction)
+        self.policy_log_ids = self._normalize_policy_log_ids(policy_log_ids)
+        self.policy_log_count = int(policy_log_count or 0)
+        self.behavior_conditioning = self._as_bool(behavior_conditioning)
+        self.behavior_conditioned_policy_id = int(behavior_conditioned_policy_id)
+        self.behavior_view_angle_max = float(behavior_view_angle_max)
+        if not np.isfinite(self.behavior_view_angle_max) or not 0.0 < self.behavior_view_angle_max <= 360.0:
+            raise ValueError("behavior_view_angle_max must be in (0, 360] degrees")
+        self.behavior_condition_features = 6 if self.behavior_conditioning else 0
+        self._behavior_seed = int(seed)
 
         # Deterministic creward (eval): when enabled, C copies creward_ego into the
         # ego agent and cycles through creward_traffic[] by entity index for
@@ -183,6 +197,7 @@ class Drive(pufferlib.PufferEnv):
             + self.max_partner_objects * self.partner_features
             + self.max_road_objects * self.road_features
             + self.creward_features
+            + self.behavior_condition_features
             + self.global_state_features
         )
         self.single_observation_space = gymnasium.spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_obs,), dtype=np.float32)
@@ -318,6 +333,11 @@ class Drive(pufferlib.PufferEnv):
         self.reward_components_raw = np.zeros(
             (self.num_agents, len(self.REWARD_COMPONENT_NAMES)), dtype=np.float32
         )
+        self.behavior_conditions = np.zeros(
+            (self.num_agents, self.behavior_condition_features), dtype=np.float32
+        )
+        self._behavior_rng = np.random.default_rng(self._behavior_seed)
+        self._behavior_done = np.zeros(self.num_agents, dtype=bool)
         env_ids = []
         for i in range(num_envs):
             cur = agent_offsets[i]
@@ -345,6 +365,7 @@ class Drive(pufferlib.PufferEnv):
                 reward_reverse=self.reward_reverse,
                 reward_jerk_legacy=self.reward_jerk_legacy,
                 reward_conditioning=self.reward_conditioning,
+                behavior_conditioning=int(self.behavior_conditioning),
                 reward_timestep=self.reward_timestep,
                 reward_goal=reward_goal,
                 reward_goal_post_respawn=reward_goal_post_respawn,
@@ -379,11 +400,116 @@ class Drive(pufferlib.PufferEnv):
             env_ids.append(env_id)
 
         self.c_envs = binding.vectorize(*env_ids)
+        self._set_policy_log_ids()
+        self._sample_behavior_conditions()
+        self._write_behavior_conditions()
 
     def reset(self, seed=0):
         binding.vec_reset(self.c_envs, seed)
         self.tick = 0
+        if self.behavior_conditioning:
+            self._behavior_rng = np.random.default_rng(int(seed))
+            self._behavior_done[:] = False
+            self._sample_behavior_conditions()
+            self._write_behavior_conditions()
         return self.observations, []
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        return bool(value)
+
+    @staticmethod
+    def _normalize_policy_log_ids(policy_log_ids):
+        if policy_log_ids is None or policy_log_ids == "":
+            return None
+        if isinstance(policy_log_ids, str):
+            return [int(value.strip()) for value in policy_log_ids.split(",") if value.strip()]
+        return [int(value) for value in policy_log_ids]
+
+    def _expanded_policy_log_ids(self):
+        if not self.policy_log_ids:
+            return None
+        repeats = (self.num_agents + len(self.policy_log_ids) - 1) // len(self.policy_log_ids)
+        return np.asarray((self.policy_log_ids * repeats)[:self.num_agents], dtype=np.int64)
+
+    def _set_policy_log_ids(self):
+        if not self.policy_log_ids or self.policy_log_count <= 0:
+            return
+        if hasattr(binding, "vec_set_policy_log_ids"):
+            binding.vec_set_policy_log_ids(
+                self.c_envs, self._expanded_policy_log_ids().tolist(), self.policy_log_count
+            )
+
+    def _conditioned_agent_mask(self):
+        policy_ids = self._expanded_policy_log_ids()
+        if policy_ids is None:
+            return np.ones(self.num_agents, dtype=bool)
+        return policy_ids == self.behavior_conditioned_policy_id
+
+    def _sample_behavior_conditions(self, mask=None):
+        if not self.behavior_conditioning:
+            return
+        if mask is None:
+            mask = np.ones(self.num_agents, dtype=bool)
+        conditioned = mask & self._conditioned_agent_mask()
+        simple = mask & ~conditioned
+        self.behavior_conditions[simple] = (
+            0.5, 0.5, 1.0, 0.25, 50.0, self.behavior_view_angle_max
+        )
+        count = int(conditioned.sum())
+        if count:
+            samples = self.behavior_conditions[conditioned]
+            samples[:, 0] = self._behavior_rng.uniform(0.0, 3.0, count)
+            samples[:, 1] = self._behavior_rng.uniform(0.0, 3.0, count)
+            samples[:, 2] = self._behavior_rng.uniform(0.0, 2.0, count)
+            samples[:, 3] = self._behavior_rng.uniform(0.0, 0.5, count)
+            samples[:, 4] = self._behavior_rng.uniform(20.0, 50.0, count)
+            samples[:, 5] = self._behavior_rng.uniform(
+                0.0, self.behavior_view_angle_max, count
+            )
+            self.behavior_conditions[conditioned] = samples
+
+    def _write_behavior_conditions(self):
+        if not self.behavior_conditioning:
+            return
+        values = self.behavior_conditions
+        normalized = np.empty_like(values)
+        normalized[:, 0] = 2.0 * values[:, 0] / 3.0 - 1.0
+        normalized[:, 1] = 2.0 * values[:, 1] / 3.0 - 1.0
+        normalized[:, 2] = values[:, 2] - 1.0
+        normalized[:, 3] = 4.0 * values[:, 3] - 1.0
+        normalized[:, 4] = 2.0 * (values[:, 4] - 20.0) / 30.0 - 1.0
+        normalized[:, 5] = 2.0 * values[:, 5] / self.behavior_view_angle_max - 1.0
+        tail_start = self.num_obs - self.behavior_condition_features
+        self.observations[:, tail_start:tail_start + self.behavior_condition_features] = normalized
+
+    def _shape_behavior_rewards(self):
+        if not self.behavior_conditioning:
+            return
+        mask = self._conditioned_agent_mask()
+        raw = self.reward_components_raw
+        components = self.reward_components
+        condition = self.behavior_conditions
+
+        collision_delta = (0.5 - condition[:, 0]) * raw[:, 0]
+        offroad_delta = (0.5 - condition[:, 1]) * raw[:, 1]
+        goal_event = raw[:, 2] > 0
+        post_respawn = goal_event & np.isclose(
+            components[:, 2], self.reward_goal_post_respawn, atol=1e-6
+        )
+        desired_goal = np.where(post_respawn, condition[:, 3], condition[:, 2])
+        goal_delta = np.where(goal_event, desired_goal - components[:, 2], 0.0)
+        adjustment = collision_delta + offroad_delta + goal_delta
+        self.rewards[mask] += adjustment[mask]
+        components[mask, 0] += collision_delta[mask]
+        components[mask, 1] += offroad_delta[mask]
+        components[mask, 2] += goal_delta[mask]
+        if hasattr(binding, "vec_add_reward_adjustments"):
+            applied = np.zeros(self.num_agents, dtype=np.float32)
+            applied[mask] = adjustment[mask]
+            binding.vec_add_reward_adjustments(self.c_envs, applied)
 
     def resample_maps(self):
         """Resample environment maps. Closes current envs and creates new ones."""
@@ -437,6 +563,7 @@ class Drive(pufferlib.PufferEnv):
                 reward_reverse=self.reward_reverse,
                 reward_jerk_legacy=self.reward_jerk_legacy,
                 reward_conditioning=self.reward_conditioning,
+                behavior_conditioning=int(self.behavior_conditioning),
                 reward_timestep=self.reward_timestep,
                 reward_goal=self.reward_goal,
                 reward_goal_post_respawn=self.reward_goal_post_respawn,
@@ -468,8 +595,12 @@ class Drive(pufferlib.PufferEnv):
             )
             env_ids.append(env_id)
         self.c_envs = binding.vectorize(*env_ids)
+        self._set_policy_log_ids()
         binding.vec_reset(self.c_envs, seed)
         self.terminals[:] = 1
+        self._behavior_done[:] = False
+        self._sample_behavior_conditions()
+        self._write_behavior_conditions()
 
     def step(self, actions):
 
@@ -484,10 +615,25 @@ class Drive(pufferlib.PufferEnv):
         else:
             binding.vec_step(self.c_envs) # truncations and terminals get set in here as well.
             self.tick += 1
+            self._shape_behavior_rewards()
+            done = (self.terminals > 0) | (self.truncations > 0)
+            newly_done = done & ~self._behavior_done
+            self._sample_behavior_conditions(newly_done)
+            self._behavior_done[:] = done
+            self._write_behavior_conditions()
             info = []
             if self.tick % self.report_interval == 0:
                 log = binding.vec_log(self.c_envs, self.num_agents)
                 if log:
+                    if (self.policy_log_ids and self.policy_log_count > 0
+                            and hasattr(binding, "vec_get_policy_logs")):
+                        policy_logs = binding.vec_get_policy_logs(
+                            self.c_envs, self.policy_log_count
+                        )
+                        log["mix_ppo"] = {
+                            f"policy_{i}": policy_log
+                            for i, policy_log in enumerate(policy_logs) if policy_log
+                        }
                     info.append(log)
                     # print(log)
             if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0: # self.tick just got increased!

@@ -401,6 +401,9 @@ struct Drive {
     unsigned char *truncations;
     Log log;
     Log *logs;
+    Log *policy_logs;
+    int *policy_log_ids;
+    int policy_log_count;
     int num_agents;
     int active_agent_count;
     int *active_agent_indices;
@@ -437,6 +440,7 @@ struct Drive {
     float reward_jerk_legacy;
     float reward_timestep;
     int reward_conditioning;  // 0: use global env->reward_*, 1: use per-agent creward_* fields
+    int behavior_conditioning; // Append a six-float Try1 behavior block to observations
     // Deterministic creward override (for eval): if 1, sample_agent_creward copies
     // creward_ego[] into the ego agent (active-index == human_agent_idx) and
     // cycles through creward_traffic[0..count-1] by agent_idx for every other
@@ -501,21 +505,20 @@ struct Drive {
 // Forward declarations for functions defined later
 void build_lane_routes(Drive* env);
 
-void add_log(Drive *env) {
-    for (int i = 0; i < env->active_agent_count; i++) {
+void add_agent_log(Drive *env, Log *dst, int i) {
         Entity *e = &env->entities[env->active_agent_indices[i]];
 
-        env->log.goals_reached_this_episode += e->goals_reached_this_episode;
-        env->log.goals_sampled_this_episode += e->goals_sampled_this_episode;
+        dst->goals_reached_this_episode += e->goals_reached_this_episode;
+        dst->goals_sampled_this_episode += e->goals_sampled_this_episode;
 
         int offroad = env->logs[i].offroad_rate;
-        env->log.offroad_rate += offroad;
+        dst->offroad_rate += offroad;
         int collided = env->logs[i].collision_rate;
-        env->log.collision_rate += collided;
+        dst->collision_rate += collided;
         float offroad_per_agent = env->logs[i].offroad_per_agent;
-        env->log.offroad_per_agent += offroad_per_agent;
+        dst->offroad_per_agent += offroad_per_agent;
         float collisions_per_agent = env->logs[i].collisions_per_agent;
-        env->log.collisions_per_agent += collisions_per_agent;
+        dst->collisions_per_agent += collisions_per_agent;
 
         float frac_goal_reached = e->goals_reached_this_episode / e->goals_sampled_this_episode;
 
@@ -533,27 +536,38 @@ void add_log(Drive *env) {
         int collision_occurred =
             (env->goal_behavior == GOAL_RESPAWN) ? e->collided_before_goal : env->logs[i].collision_rate;
         if (frac_goal_reached > threshold && !collision_occurred) {
-            env->log.score += 1.0f;
+            dst->score += 1.0f;
         }
         if (!offroad && !collided && frac_goal_reached < 1.0f) {
-            env->log.dnf_rate += 1.0f;
+            dst->dnf_rate += 1.0f;
         }
         int lane_aligned = env->logs[i].lane_alignment_rate;
-        env->log.lane_alignment_rate += lane_aligned;
-        env->log.lane_aligned_steps += env->logs[i].lane_aligned_steps;
-        env->log.speed_limit_rate += env->logs[i].speed_limit_rate;
-        env->log.lane_distance_avg += env->logs[i].lane_distance_avg;
-        env->log.lane_distance_count += env->logs[i].lane_distance_count;
-        env->log.velocity_reward_total += env->logs[i].velocity_reward_total;
-        env->log.comfort_violations += env->logs[i].comfort_violations;
-        env->log.speed_at_goal += env->logs[i].speed_at_goal;
-        env->log.episode_length += env->logs[i].episode_length;
-        env->log.episode_return += env->logs[i].episode_return;
+        dst->lane_alignment_rate += lane_aligned;
+        dst->lane_aligned_steps += env->logs[i].lane_aligned_steps;
+        dst->speed_limit_rate += env->logs[i].speed_limit_rate;
+        dst->lane_distance_avg += env->logs[i].lane_distance_avg;
+        dst->lane_distance_count += env->logs[i].lane_distance_count;
+        dst->velocity_reward_total += env->logs[i].velocity_reward_total;
+        dst->comfort_violations += env->logs[i].comfort_violations;
+        dst->speed_at_goal += env->logs[i].speed_at_goal;
+        dst->episode_length += env->logs[i].episode_length;
+        dst->episode_return += env->logs[i].episode_return;
         // Log composition counts per agent so vec_log averaging recovers the per-env value
-        env->log.active_agent_count += env->active_agent_count;
-        env->log.expert_static_agent_count += env->expert_static_agent_count;
-        env->log.static_agent_count += env->static_agent_count;
-        env->log.n += 1;
+        dst->active_agent_count += env->active_agent_count;
+        dst->expert_static_agent_count += env->expert_static_agent_count;
+        dst->static_agent_count += env->static_agent_count;
+        dst->n += 1;
+}
+
+void add_log(Drive *env) {
+    for (int i = 0; i < env->active_agent_count; i++) {
+        add_agent_log(env, &env->log, i);
+        if (env->policy_logs && env->policy_log_ids && i < env->num_agents) {
+            int policy_id = env->policy_log_ids[i];
+            if (policy_id >= 0 && policy_id < env->policy_log_count) {
+                add_agent_log(env, &env->policy_logs[policy_id], i);
+            }
+        }
     }
 }
 
@@ -1857,6 +1871,8 @@ void c_close(Drive *env) {
     free(env->entities);
     free(env->active_agent_indices);
     free(env->logs);
+    free(env->policy_logs);
+    free(env->policy_log_ids);
     // GridMap cleanup
     int grid_cell_count = env->grid_map->grid_cols * env->grid_map->grid_rows;
     for (int grid_index = 0; grid_index < grid_cell_count; grid_index++) {
@@ -1882,7 +1898,8 @@ void allocate(Drive *env) {
     int ego_dim = (env->dynamics_model == JERK || env->emit_jerk_ego_obs) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
     int extra = env->include_global_state ? GLOBAL_STATE_FEATURES : 0;
     int creward_dim = env->reward_conditioning ? CREWARD_FEATURES : 0;
-    int max_obs = ego_dim + PARTNER_FEATURES * env->max_obs_partners + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + extra;
+    int behavior_dim = env->behavior_conditioning ? 6 : 0;
+    int max_obs = ego_dim + PARTNER_FEATURES * env->max_obs_partners + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + behavior_dim + extra;
     env->observations = (float *)calloc(env->active_agent_count * max_obs, sizeof(float));
     env->actions = (float *)calloc(env->active_agent_count * 2, sizeof(float));
     env->rewards = (float *)calloc(env->active_agent_count, sizeof(float));
@@ -2225,7 +2242,8 @@ void compute_observations(Drive *env) {
     int ego_dim = (env->dynamics_model == JERK || env->emit_jerk_ego_obs) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
     int extra = env->include_global_state ? GLOBAL_STATE_FEATURES : 0;
     int creward_dim = env->reward_conditioning ? CREWARD_FEATURES : 0;
-    int max_obs = ego_dim + PARTNER_FEATURES * env->max_obs_partners + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + extra;
+    int behavior_dim = env->behavior_conditioning ? 6 : 0;
+    int max_obs = ego_dim + PARTNER_FEATURES * env->max_obs_partners + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + behavior_dim + extra;
     memset(env->observations, 0, max_obs * env->active_agent_count * sizeof(float));
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -2418,7 +2436,6 @@ void compute_observations(Drive *env) {
             obs[obs_idx++] = 2.0f * (ego_entity->creward_alpha_reverse     -  2.5e-4f) / (7.5e-3f - 2.5e-4f) - 1.0f;
             obs[obs_idx++] = 2.0f * (ego_entity->creward_goal_speed        -  3.0f)    / (30.0f   -  3.0f)   - 1.0f;
         }
-
         // Append absolute global state for SMART reference model (SPACeR KL)
         if (env->include_global_state) {
             obs[obs_idx]     = ego_entity->x;
@@ -2428,6 +2445,10 @@ void compute_observations(Drive *env) {
             obs[obs_idx + 4] = ego_entity->vx;
             obs[obs_idx + 5] = ego_entity->vy;
             obs[obs_idx + 6] = (float)env->map_id;
+            obs_idx += GLOBAL_STATE_FEATURES;
+        }
+        if (env->behavior_conditioning) {
+            obs_idx += 6; // Python writes the role-aware behavior condition block.
         }
     }
 }
@@ -2789,8 +2810,9 @@ DriveSnapshot* create_snapshot(Drive* env) {
     int ego_dim = (env->dynamics_model == JERK || env->emit_jerk_ego_obs) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
     int gs_extra = env->include_global_state ? GLOBAL_STATE_FEATURES : 0;
     int creward_dim = env->reward_conditioning ? CREWARD_FEATURES : 0;
+    int behavior_dim = env->behavior_conditioning ? 6 : 0;
     int obs_per_agent = ego_dim + PARTNER_FEATURES * env->max_obs_partners
-        + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + gs_extra;
+        + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + behavior_dim + gs_extra;
     snapshot->obs_size = env->active_agent_count * obs_per_agent;
     snapshot->observations = (float*)calloc(snapshot->obs_size, sizeof(float));
     if (snapshot->observations) {
@@ -4468,7 +4490,8 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
     int ego_dim = (env->dynamics_model == JERK || env->emit_jerk_ego_obs) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
     int extra = env->include_global_state ? GLOBAL_STATE_FEATURES : 0;
     int creward_dim = env->reward_conditioning ? CREWARD_FEATURES : 0;
-    int max_obs = ego_dim + PARTNER_FEATURES * env->max_obs_partners + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + extra;
+    int behavior_dim = env->behavior_conditioning ? 6 : 0;
+    int max_obs = ego_dim + PARTNER_FEATURES * env->max_obs_partners + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + creward_dim + behavior_dim + extra;
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     float *agent_obs = &observations[agent_index][0];
     // self

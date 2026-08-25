@@ -234,6 +234,128 @@ class DriveConditioned(nn.Module):
         return action, value
 
 
+class DriveBehaviorConditioned(nn.Module):
+    """Try1 opponent policy conditioned on four rewards and two view limits.
+
+    The six normalized values are appended to the observation by ``Drive``.
+    Partner masking is applied before the partner encoder, while the base
+    ``Drive`` policy continues to ignore the appended block.
+    """
+
+    condition_dim = 6
+
+    def __init__(self, env, input_size=128, hidden_size=128, action_chunk_size=1, **kwargs):
+        super().__init__()
+        if getattr(env, "behavior_condition_features", 0) != self.condition_dim:
+            raise ValueError(
+                "DriveBehaviorConditioned requires env.behavior_conditioning=True"
+            )
+        self.hidden_size = hidden_size
+        self.action_chunk_size = action_chunk_size
+        self.max_partner_objects = env.max_partner_objects
+        self.partner_features = env.partner_features
+        self.max_road_objects = env.max_road_objects
+        self.road_features = env.road_features
+        self.road_features_after_onehot = env.road_features + 6
+        self.ego_dim = 10 if env.dynamics_model == "jerk" else 7
+        self.behavior_view_angle_max = float(
+            getattr(env, "behavior_view_angle_max", 180.0)
+        )
+
+        def encoder(in_features):
+            return nn.Sequential(
+                pufferlib.pytorch.layer_init(nn.Linear(in_features, input_size)),
+                nn.LayerNorm(input_size),
+                pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+            )
+
+        self.ego_encoder = encoder(self.ego_dim)
+        self.partner_encoder = encoder(self.partner_features)
+        self.road_encoder = encoder(self.road_features_after_onehot)
+        self.condition_encoder = encoder(self.condition_dim)
+        self.shared_embedding = nn.Sequential(
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(4 * input_size, hidden_size)),
+        )
+        self.is_continuous = isinstance(env.single_action_space, pufferlib.spaces.Box)
+        self.atn_dim = (
+            (env.single_action_space.shape[0],) * 2
+            if self.is_continuous else env.single_action_space.nvec.tolist()
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, sum(self.atn_dim)), std=0.01
+        )
+        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        return self.decode_actions(self.encode_observations(observations))
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def apply_partner_mask(self, partner_objects, condition):
+        radius = 20.0 + 15.0 * (condition[:, 4] + 1.0)
+        view_angle = (
+            0.5 * torch.pi * (condition[:, 5] + 1.0)
+            * (self.behavior_view_angle_max / 180.0)
+        )
+        rel_x = partner_objects[:, :, 0]
+        rel_y = partner_objects[:, :, 1]
+        valid = partner_objects[:, :, 2] > 0
+        distance = torch.sqrt(rel_x.square() + rel_y.square())
+        bearing = torch.abs(torch.atan2(rel_y, rel_x))
+        visible = (
+            valid
+            & (distance <= 0.02 * radius[:, None])
+            & (bearing <= 0.5 * view_angle[:, None] + 1e-6)
+        )
+        return partner_objects * visible.unsqueeze(-1)
+
+    def encode_observations(self, observations, state=None):
+        partner_dim = self.max_partner_objects * self.partner_features
+        road_dim = self.max_road_objects * self.road_features
+        ego_obs = observations[:, :self.ego_dim]
+        partner_start = self.ego_dim
+        road_start = partner_start + partner_dim
+        condition = observations[:, -self.condition_dim:]
+        partner_objects = observations[
+            :, partner_start:road_start
+        ].reshape(-1, self.max_partner_objects, self.partner_features)
+        partner_objects = self.apply_partner_mask(partner_objects, condition)
+
+        road_objects = observations[:, road_start:road_start + road_dim].reshape(
+            -1, self.max_road_objects, self.road_features
+        )
+        road_continuous = road_objects[:, :, :self.road_features - 1]
+        road_categorical = F.one_hot(
+            road_objects[:, :, self.road_features - 1].long(), num_classes=7
+        )
+        road_objects = torch.cat([road_continuous, road_categorical], dim=2)
+
+        ego_features = self.ego_encoder(ego_obs)
+        partner_features, _ = self.partner_encoder(partner_objects).max(dim=1)
+        road_features, _ = self.road_encoder(road_objects).max(dim=1)
+        condition_features = self.condition_encoder(condition)
+        features = torch.cat(
+            [ego_features, road_features, partner_features, condition_features], dim=1
+        )
+        return F.relu(self.shared_embedding(features))
+
+    def decode_actions(self, flat_hidden):
+        if self.is_continuous:
+            parameters = self.actor(flat_hidden)
+            loc, scale = torch.split(parameters, self.atn_dim, dim=1)
+            action = torch.distributions.Normal(
+                loc, torch.nn.functional.softplus(scale) + 1e-4
+            )
+        else:
+            action = torch.split(self.actor(flat_hidden), self.atn_dim, dim=1)
+        return action, self.value_fn(flat_hidden)
+
+
 class DriveTransformer(nn.Module):
     """Drive policy with ego-centric cross-attention over partner and road entities.
 
