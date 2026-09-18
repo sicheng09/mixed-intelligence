@@ -1,0 +1,26 @@
+{
+  "env_config": "pufferlib/config/ocean/drive_try1_mix_ppo.ini",
+  "data_root": "data/binaries_full",
+  "split": "validation",
+  "checkpoints": [
+    "experiments/puffer_drive_178958541908/model_policy_0_puffer_drive_002000.pt",
+    "experiments/puffer_drive_178958541908/model_policy_1_puffer_drive_002000.pt"
+  ],
+  "variants": ["global", "floor", "baseline", "context"],
+  "seeds": [917],
+  "train_maps": "0:4",
+  "development_maps": "40:42",
+  "confirmation_maps": "120:122",
+  "evaluation_seeds": [1901, 2903],
+  "stages": 3,
+  "batch": 16,
+  "horizon": 90,
+  "gamma": 0.98,
+  "std": 0.35,
+  "lr": 0.05,
+  "epochs": 8,
+  "target_kl": 0.02,
+  "baseline_lr": 0.001,
+  "baseline_epochs": 40,
+  "env_cache_size": 8
+}

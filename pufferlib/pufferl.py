@@ -57,6 +57,12 @@ from pufferlib.policy_sampling import (
     parse_stratified_policy_specs,
     resolve_policy_update_steps,
 )
+from pufferlib.population_adversary import (
+    GaussianPopulationPolicy,
+    cosine_exploration_std,
+    latent_to_beta,
+    population_ppo_loss,
+)
 
 try:
     from pufferlib import _C
@@ -421,6 +427,170 @@ class PuffeRL:
         self._adv_filter_retention = 0.0
         self._adv_filter_threshold_value = 0.0
 
+        # Optional, context-free policy over behavior-condition distributions.
+        # It is deliberately separate from both driving-policy optimizers.
+        self.population_mode = config.get("population_mode", "legacy")
+        self.population_runtime = None
+        self.population_adversary = (self.population_mode == "legacy" and
+                                     _as_bool(config.get("population_adversary", False)))
+        self.population_samples = []
+        self.population_sample_count = 0
+        self.population_policy = None
+        self.population_optimizer = None
+        if self.population_adversary:
+            if not self.mix_ppo or self.mix_ppo_sampling != "stratified":
+                raise pufferlib.APIUsageError(
+                    "population_adversary requires stratified mix_ppo"
+                )
+            if torch.distributed.is_initialized():
+                raise pufferlib.APIUsageError(
+                    "population_adversary does not yet support DDP"
+                )
+            self.population_policy = GaussianPopulationPolicy(
+                float(config.get("population_rho_min", 0.02)),
+                float(config.get("population_rho_max", 0.5)),
+            ).to(device)
+            self.population_optimizer = torch.optim.Adam(
+                self.population_policy.parameters(),
+                lr=float(config.get("population_learning_rate", 3e-4)),
+            )
+            self._sync_population_policy()
+
+    def _population_std(self):
+        return cosine_exploration_std(
+            self.population_sample_count,
+            int(self.config.get("population_std_decay_samples", 100_000)),
+            float(self.config.get("population_std_start", 0.5)),
+            float(self.config.get("population_std_end", 0.05)),
+        )
+
+    def _sync_population_policy(self):
+        if not self.population_adversary:
+            return
+        mean = self.population_policy.mean.detach().cpu().numpy()
+        self.vecenv.set_population_policy(mean, self._population_std())
+
+    def _collect_population_samples(self, infos):
+        if not self.population_adversary:
+            return
+        added = 0
+        for info in infos:
+            records = info.get("population_adversary_samples", [])
+            if records:
+                self.population_samples.extend(records)
+                added += len(records)
+        if added:
+            self.population_sample_count += added
+            # The external schedule may change even when q_phi has not updated.
+            self._sync_population_policy()
+
+    def _train_population_adversary(self):
+        if getattr(self, "population_runtime", None) is not None:
+            return self.population_runtime.after_driver_update()
+        if not self.population_adversary:
+            return {}
+        batch_size = int(self.config.get("population_batch_size", 256))
+        if len(self.population_samples) < batch_size:
+            return self._population_diagnostics()
+
+        # Consume the complete collection together; chunks below only bound memory.
+        records = self.population_samples[:]
+        self.population_samples.clear()
+        batch_size = len(records)
+        device = self.config["device"]
+        latent = torch.as_tensor(
+            np.asarray([r["latent"] for r in records]), dtype=torch.float32, device=device
+        )
+        old_mean = torch.as_tensor(
+            np.asarray([r["old_mean"] for r in records]), dtype=torch.float32, device=device
+        )
+        old_std = torch.as_tensor(
+            [r["old_std"] for r in records], dtype=torch.float32, device=device
+        )
+        raw_advantage = torch.as_tensor(
+            [r["advantage"] for r in records], dtype=torch.float32, device=device
+        )
+        advantage = raw_advantage - raw_advantage.mean()
+        if raw_advantage.numel() > 1 and raw_advantage.std(unbiased=False) > 1e-8:
+            advantage = advantage / raw_advantage.std(unbiased=False)
+
+        epochs = int(self.config.get("population_update_epochs", 4))
+        minibatch_size = int(self.config.get("population_minibatch_size", 64))
+        clip_coef = float(self.config.get("population_clip_coef", 0.2))
+        target_kl = float(self.config.get("population_target_kl", 0.03))
+        initial_mean = self.population_policy.mean.detach().clone()
+        with torch.no_grad():
+            old_kl = (0.5 * ((initial_mean - old_mean) / old_std[:, None]).square().sum(-1))
+            residual = (latent - old_mean) / old_std[:, None]
+            # Correlation, not raw challenge magnitude, indicates a search direction.
+            centered = residual - residual.mean(0)
+            correlation = (centered * advantage[:, None]).mean(0) / centered.square().mean(0).sqrt().clamp_min(1e-8)
+        losses, clipfracs = [], []
+        optimizer_steps = 0
+        for _ in range(epochs):
+            # A single gradient over the collection avoids moving the mean between
+            # chunks of data sampled under the same behavior policy.
+            self.population_optimizer.zero_grad()
+            for indices in torch.randperm(batch_size, device=device).split(minibatch_size):
+                loss, ratio = population_ppo_loss(
+                    self.population_policy,
+                    latent[indices], old_mean[indices], old_std[indices],
+                    advantage[indices], clip_coef,
+                )
+                weight = indices.numel() / batch_size
+                (loss * weight).backward()
+                losses.append(float(loss.detach()) * weight)
+                clipfracs.append(float(((ratio - 1.0).abs() > clip_coef).float().mean()) * weight)
+            torch.nn.utils.clip_grad_norm_(
+                self.population_policy.parameters(),
+                float(self.config.get("population_max_grad_norm", 1.0)),
+            )
+            self.population_optimizer.step()
+            optimizer_steps += 1
+            with torch.no_grad():
+                update_kl = (0.5 * ((self.population_policy.mean - initial_mean) / old_std[:, None]).square().sum(-1)).mean()
+            # Stop further epochs after exceeding the incremental KL budget.
+            if target_kl > 0 and float(update_kl) > target_kl:
+                break
+
+        self._sync_population_policy()
+        return self._population_diagnostics({
+            "population/policy_loss": float(sum(losses) / max(optimizer_steps, 1)),
+            "population/challenge_mean": float(raw_advantage.mean()),
+            "population/challenge_std": float(raw_advantage.std(unbiased=False)),
+            "population/bootstrap_correction": float(np.mean([
+                r.get("bootstrap_correction", 0.0) for r in records
+            ])),
+            "population/clipfrac": float(sum(clipfracs) / max(optimizer_steps, 1)),
+            "population/train_samples": batch_size,
+            "population/optimizer_steps": optimizer_steps,
+            "population/behavior_kl": float(old_kl.mean()),
+            "population/update_kl": float(update_kl) if optimizer_steps else 0.0,
+            "population/signal_corr_max": float(correlation.abs().max()),
+            **{f"population/signal_corr_{i}": float(v) for i, v in enumerate(correlation)},
+        })
+
+    def _population_diagnostics(self, metrics=None):
+        metrics = dict(metrics or {})
+        latent_mean = self.population_policy.mean.detach().float().cpu().numpy()
+        _, _, beta_mean, beta_rho = latent_to_beta(
+            latent_mean,
+            float(self.config.get("population_epsilon", 0.02)),
+            float(self.config.get("population_rho_min", 0.02)),
+            float(self.config.get("population_rho_max", 0.5)),
+        )
+        metrics.update({
+            "population/sample_count": self.population_sample_count,
+            "population/buffer_size": len(self.population_samples),
+            "population/exploration_std": self._population_std(),
+        })
+        for index, value in enumerate(latent_mean):
+            metrics[f"population/latent_mean_{index}"] = float(value)
+        for index, (mean, rho) in enumerate(zip(beta_mean, beta_rho)):
+            metrics[f"population/beta_mean_{index}"] = float(mean)
+            metrics[f"population/beta_rho_{index}"] = float(rho)
+        return metrics
+
     @property
     def uptime(self):
         return time.time() - self.start_time
@@ -673,8 +843,11 @@ class PuffeRL:
                     action = np.clip(action, self.vecenv.action_space.low, self.vecenv.action_space.high)
 
             profile("eval_misc", epoch)
+            self._collect_population_samples(info)
             for i in info:
                 for k, v in pufferlib.unroll_nested_dict(i):
+                    if k.startswith("population_adversary_samples"):
+                        continue
                     if isinstance(v, np.ndarray):
                         v = v.tolist()
                     elif isinstance(v, (list, tuple)):
@@ -683,6 +856,8 @@ class PuffeRL:
                         self.stats[k].append(v)
 
             profile("env", epoch)
+            if self.population_adversary and hasattr(self.vecenv, "set_policy_values"):
+                self.vecenv.set_policy_values(value.detach().float().cpu().numpy())
             self.vecenv.send(action)
 
         # Extra sync loop for next-state value estimation
@@ -1252,6 +1427,7 @@ class PuffeRL:
             else 1 - (y_true - y_pred).var() / var_y
         )
         losses["explained_variance"] = explained_var.item()
+        losses.update(self._train_population_adversary())
 
         profile.end()
         logs = None
@@ -1743,6 +1919,8 @@ class PuffeRL:
         return logs
 
     def close(self):
+        if self.population_runtime is not None:
+            self.population_runtime.close()
         self.vecenv.close()
         self.utilization.stop()
         model_path = self.save_checkpoint()
@@ -1805,6 +1983,25 @@ class PuffeRL:
             "mix_policy_model_names": mix_policy_model_names,
             "run_id": run_id,
         }
+        state["population_mode"] = self.population_mode
+        if self.population_mode != "legacy":
+            state["main_training_spec"] = {k: self.config[k] for k in
+                ("batch_size", "total_timesteps", "optimizer", "anneal_lr", "seed")}
+            state["scheduler_state_dicts"] = [x.state_dict() if x is not None else None
+                                               for x in self.schedulers]
+            state["main_cpu_rng"] = torch.get_rng_state()
+            state["main_numpy_rng"] = np.random.get_state()
+            if str(self.config["device"]).startswith("cuda"):
+                state["main_cuda_rng"] = torch.cuda.get_rng_state(self.config["device"])
+        if self.population_runtime is not None:
+            state["main_population_state"] = self.population_runtime.state_dict()
+        if self.population_adversary:
+            state.update({
+                "population_policy_state_dict": self.population_policy.state_dict(),
+                "population_optimizer_state_dict": self.population_optimizer.state_dict(),
+                "population_sample_count": self.population_sample_count,
+                "population_samples": self.population_samples,
+            })
         state_path = os.path.join(path, "trainer_state.pt")
         torch.save(state, state_path + ".tmp")
         os.rename(state_path + ".tmp", state_path)
@@ -1908,6 +2105,66 @@ class PuffeRL:
                 l.add_row(f"{c2}{metric}", f"{b2}{value:.3f}")
             monitor.add_row(s, p, l)
         dashboard.add_row(monitor)
+
+        if getattr(self, "population_adversary", False) or getattr(self, "population_runtime", None) is not None:
+            population_table = Table(box=None, expand=True, pad_edge=False)
+            population_table.add_column(
+                f"{c1}q_phi Population", justify="left", width=24
+            )
+            population_table.add_column(f"{c1}Value", justify="right", width=12)
+            population_table.add_column(f"{c1}Distribution", justify="left", width=24)
+            population_table.add_column(f"{c1}Value", justify="right", width=12)
+            population_metrics = [
+                ("samples", "population/sample_count"),
+                ("buffer", "population/buffer_size"),
+                ("exploration_std", "population/exploration_std"),
+                ("challenge_mean", "population/challenge_mean"),
+                ("challenge_std", "population/challenge_std"),
+                ("policy_loss", "population/policy_loss"),
+                ("clipfrac", "population/clipfrac"),
+                ("train_samples", "population/train_samples"),
+                ("behavior_kl", "population/behavior_kl"),
+                ("update_kl", "population/update_kl"),
+                ("signal_corr_max", "population/signal_corr_max"),
+                ("bootstrap_correction", "population/bootstrap_correction"),
+            ]
+            distribution_metrics = [
+                (f"beta_{i}_mean", f"population/beta_mean_{i}")
+                for i in range(6)
+            ] + [
+                (f"beta_{i}_rho", f"population/beta_rho_{i}")
+                for i in range(6)
+            ]
+            if self.population_runtime is not None:
+                population_metrics = [("version", "population/main_version"),
+                    ("q_samples", "population/q_samples"), ("q_agent_steps", "population/q_agent_steps"),
+                    ("challenge", "population/challenge_mean"),
+                    ("return", "population/return_mean"),
+                    ("bootstrap", "population/bootstrap_mean"),
+                    ("update_kl", "population/update_kl"),
+                    ("distribution_tv", "population/distribution_tv"),
+                    ("entropy", "population/policy_entropy"),
+                    ("min_component_n", "population/phase_min_component_count"),
+                    ("backtracks", "population/phase_backtracks")]
+                distribution_metrics = [(name, f"population/component_{i}_prob")
+                    for i, name in enumerate(self.population_runtime.learner.policy.names)]
+            rows = max(len(population_metrics), len(distribution_metrics))
+            for row in range(rows):
+                left_name, left_value = "", ""
+                right_name, right_value = "", ""
+                if row < len(population_metrics):
+                    left_name, key = population_metrics[row]
+                    if key in self.losses:
+                        left_value = f"{b2}{self.losses[key]:.4f}"
+                if row < len(distribution_metrics):
+                    right_name, key = distribution_metrics[row]
+                    if key in self.losses:
+                        right_value = f"{b2}{self.losses[key]:.4f}"
+                population_table.add_row(
+                    f"{c2}{left_name}", left_value,
+                    f"{c2}{right_name}", right_value,
+                )
+            dashboard.add_row(population_table)
 
         table = Table(box=None, expand=True, pad_edge=False)
         dashboard.add_row(table)
@@ -2219,6 +2476,9 @@ class WandbLogger:
 
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
+    if args["train"].get("population_mode", "legacy") != "legacy":
+        np.random.seed(int(args["train"]["seed"]))
+        torch.manual_seed(int(args["train"]["seed"]))
     # Default to "training" split if not overridden via --env.split
     if "split" not in args.get("env", {}):
         args["env"]["split"] = "training"
@@ -2266,6 +2526,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     train_config = dict(**args["train"], env=env_name, eval=args.get("eval", {}))
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
+    if pufferl.population_mode in ("fixed", "adaptive"):
+        from pufferlib.population_runtime import MainPopulationRuntime
+        runtime_env = dict(args["env"])
+        runtime_env.update(data_root=vecenv.driver_env.data_root,
+                           num_maps=vecenv.driver_env.num_maps)
+        pufferl.population_runtime = MainPopulationRuntime(pufferl, runtime_env)
 
     # Restore global_step and epoch from trainer_state when resuming
     load_path = args.get("load_model_path")
@@ -2273,8 +2539,50 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         state_path = os.path.join(os.path.dirname(load_path), "trainer_state.pt")
         if os.path.exists(state_path):
             trainer_state = torch.load(state_path, map_location="cpu", weights_only=False)
+            saved_mode = trainer_state.get("population_mode", "legacy")
+            if saved_mode != pufferl.population_mode:
+                raise ValueError("population mode differs: use mix_ppo_policy_paths for a fresh driver-only branch")
+            if pufferl.population_runtime is not None:
+                if "main_population_state" not in trainer_state:
+                    raise ValueError("missing main population state on resume")
+                pufferl.population_runtime.load_state_dict(trainer_state["main_population_state"])
+            if pufferl.population_mode != "legacy":
+                spec = trainer_state.get("main_training_spec")
+                if spec != {k: train_config[k] for k in
+                            ("batch_size", "total_timesteps", "optimizer", "anneal_lr", "seed")}:
+                    raise ValueError("main-training resume spec mismatch; use a fresh driver-only branch")
+                names = trainer_state["mix_policy_model_names"]
+                for driver, name, optimizer, opt_state, scheduler, sched_state in zip(
+                        pufferl.uncompiled_policies, names, pufferl.optimizers,
+                        trainer_state["optimizer_state_dicts"], pufferl.schedulers,
+                        trainer_state["scheduler_state_dicts"]):
+                    driver.load_state_dict(torch.load(os.path.join(os.path.dirname(state_path), name),
+                                                      map_location=train_config["device"], weights_only=True))
+                    if optimizer is not None:
+                        optimizer.load_state_dict(opt_state)
+                        scheduler.load_state_dict(sched_state)
+                torch.set_rng_state(trainer_state["main_cpu_rng"])
+                np.random.set_state(trainer_state["main_numpy_rng"])
+                if "main_cuda_rng" in trainer_state:
+                    torch.cuda.set_rng_state(trainer_state["main_cuda_rng"], train_config["device"])
+                # Simulator state is not checkpointed: resume at an explicit reset,
+                # with restored q already published, never mid-window.
+                vecenv.async_reset(int(train_config["seed"]) + int(trainer_state.get("update", 0)))
             pufferl.global_step = trainer_state.get("global_step", 0)
             pufferl.epoch = trainer_state.get("update", 0)
+            if pufferl.population_adversary and "population_policy_state_dict" in trainer_state:
+                pufferl.population_policy.load_state_dict(
+                    trainer_state["population_policy_state_dict"]
+                )
+                if "population_optimizer_state_dict" in trainer_state:
+                    pufferl.population_optimizer.load_state_dict(
+                        trainer_state["population_optimizer_state_dict"]
+                    )
+                pufferl.population_sample_count = trainer_state.get(
+                    "population_sample_count", 0
+                )
+                pufferl.population_samples = trainer_state.get("population_samples", [])
+                pufferl._sync_population_policy()
             # Use wandb's last step if higher (run may have logged beyond last checkpoint)
             if args.get("wandb") and hasattr(logger, 'wandb') and logger.wandb.run is not None:
                 wandb_step = logger.wandb.run.summary.get("_step", 0)
@@ -2691,6 +2999,22 @@ def load_env(env_name, args):
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
     env_kwargs = dict(args["env"])
+    mode = args.get("train", {}).get("population_mode", "legacy")
+    if mode not in ("legacy", "uniform", "fixed", "adaptive"):
+        raise ValueError("population_mode must be legacy, uniform, fixed or adaptive")
+    if mode != "legacy":
+        env_kwargs["population_adversary"] = False
+        env_kwargs["population_sampling"] = "mixture" if mode in ("fixed", "adaptive") else "legacy"
+        env_kwargs["population_descriptor_std"] = args["train"].get("population_descriptor_std", .35)
+    population_env_keys = (
+        "population_adversary", "population_gamma", "population_episode_decay",
+        "population_epsilon", "population_rho_min", "population_rho_max",
+        "population_std_start",
+    )
+    if mode == "legacy" and _as_bool(args.get("train", {}).get("population_adversary", False)):
+        for key in population_env_keys:
+            if key in args["train"]:
+                env_kwargs[key] = args["train"][key]
     if _as_bool(args.get("train", {}).get("mix_ppo", False)):
         _, fractions = parse_policy_mix(args["train"].get("mix_ppo_policy_mix", None))
         ppo_agents = int(env_kwargs.get("num_agents", 1))

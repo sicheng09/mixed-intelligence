@@ -13,6 +13,8 @@ import os
 import pufferlib
 from pathlib import Path
 from pufferlib.ocean.drive import binding
+from pufferlib.population_adversary import (initial_population_mean, latent_to_beta,
+    population_anchors, mixture_payload, read_mixture, publish_mixture)
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
@@ -92,6 +94,15 @@ class Drive(pufferlib.PufferEnv):
         behavior_conditioning=False,  # Try1 six-dimensional behavior condition
         behavior_conditioned_policy_id=1,
         behavior_view_angle_max=180.0,  # Maximum sampled view angle in degrees
+        population_sampling="legacy",
+        population_descriptor_std=0.35,
+        population_adversary=False,  # Learn the distribution of behavior conditions
+        population_gamma=0.98,
+        population_episode_decay=0.8,
+        population_epsilon=0.02,
+        population_rho_min=0.02,
+        population_rho_max=0.5,
+        population_std_start=0.5,
         creward_deterministic=False,  # Eval-only: use fixed ego/traffic creward profiles
         emit_jerk_ego_obs=False,  # Force 10-dim jerk ego obs layout even in classic dynamics
         ego_entity_idx=-1,   # Eval-only: entity index of the ego for creward_ego dispatch.
@@ -160,6 +171,27 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError("behavior_view_angle_max must be in (0, 360] degrees")
         self.behavior_condition_features = 6 if self.behavior_conditioning else 0
         self._behavior_seed = int(seed)
+        self.population_sampling = population_sampling
+        self.population_descriptor_std = float(population_descriptor_std)
+        if population_sampling not in ("legacy", "mixture"):
+            raise ValueError("population_sampling must be legacy or mixture")
+        if population_sampling == "mixture" and (not self.behavior_conditioning or self._as_bool(population_adversary)):
+            raise ValueError("mixture sampling requires conditioning and disables legacy adversary")
+        self._population_mixture = (buf["population_mixture"]
+            if buf is not None and "population_mixture" in buf
+            else mixture_payload(self.population_descriptor_std))
+        self.population_adversary = self._as_bool(population_adversary)
+        self.population_gamma = float(population_gamma)
+        self.population_episode_decay = float(population_episode_decay)
+        self.population_epsilon = float(population_epsilon)
+        self.population_rho_min = float(population_rho_min)
+        self.population_rho_max = float(population_rho_max)
+        self.population_std_start = float(population_std_start)
+        self.population_initial_mean = initial_population_mean(
+            self.population_rho_min, self.population_rho_max
+        )
+        if self.population_adversary and not self.behavior_conditioning:
+            raise ValueError("population_adversary requires behavior_conditioning=True")
 
         # Deterministic creward (eval): when enabled, C copies creward_ego into the
         # ego agent and cycles through creward_traffic[] by entity index for
@@ -321,6 +353,18 @@ class Drive(pufferlib.PufferEnv):
         self.map_ids = map_ids
         self.num_envs = num_envs
         super().__init__(buf=buf)
+        self._policy_values = (
+            buf.get("policy_values") if buf is not None and "policy_values" in buf
+            else np.zeros(self.num_agents, dtype=np.float32)
+        )
+        self._population_policy_mean = (
+            buf.get("population_policy_mean") if buf is not None and "population_policy_mean" in buf
+            else self.population_initial_mean.copy()
+        )
+        self._population_policy_std = (
+            buf.get("population_policy_std") if buf is not None and "population_policy_std" in buf
+            else np.asarray([self.population_std_start], dtype=np.float32)
+        )
         # Per-step reward breakdown buffer (one row per agent). C env writes
         # each component's contribution to the slot RC_* (see drive.h);
         # evaluator reads `reward_components[ego_agent_idx]` per step.
@@ -338,6 +382,7 @@ class Drive(pufferlib.PufferEnv):
         )
         self._behavior_rng = np.random.default_rng(self._behavior_seed)
         self._behavior_done = np.zeros(self.num_agents, dtype=bool)
+        self._initialize_population_window()
         env_ids = []
         for i in range(num_envs):
             cur = agent_offsets[i]
@@ -401,6 +446,7 @@ class Drive(pufferlib.PufferEnv):
 
         self.c_envs = binding.vectorize(*env_ids)
         self._set_policy_log_ids()
+        self._sample_population_window()
         self._sample_behavior_conditions()
         self._write_behavior_conditions()
 
@@ -410,6 +456,8 @@ class Drive(pufferlib.PufferEnv):
         if self.behavior_conditioning:
             self._behavior_rng = np.random.default_rng(int(seed))
             self._behavior_done[:] = False
+            self._reset_population_tracking()
+            self._sample_population_window()
             self._sample_behavior_conditions()
             self._write_behavior_conditions()
         return self.observations, []
@@ -448,6 +496,161 @@ class Drive(pufferlib.PufferEnv):
             return np.ones(self.num_agents, dtype=bool)
         return policy_ids == self.behavior_conditioned_policy_id
 
+    def set_policy_values(self, values):
+        """Side channel used by the trainer; the public step API is unchanged."""
+        np.copyto(self._policy_values, np.asarray(values, dtype=np.float32))
+
+    def set_population_mixture(self, probabilities, std, version):
+        publish_mixture(self._population_mixture, probabilities, std, version)
+
+    def set_population_policy(self, mean, std):
+        np.copyto(self._population_policy_mean, np.asarray(mean, dtype=np.float32))
+        self._population_policy_std[...] = float(std)
+
+    def _initialize_population_window(self):
+        self._population_latent = np.zeros((self.num_envs, 12), dtype=np.float32)
+        self._population_old_mean = np.zeros((self.num_envs, 12), dtype=np.float32)
+        self._population_sampled_std = np.zeros(self.num_envs, dtype=np.float32)
+        self._population_beta_alpha = np.ones((self.num_envs, 6), dtype=np.float32)
+        self._population_beta_beta = np.ones((self.num_envs, 6), dtype=np.float32)
+        self._population_window_score = np.zeros(self.num_envs, dtype=np.float32)
+        self._population_episode_count = np.zeros(self.num_envs, dtype=np.int32)
+        self._population_simple_mask = ~self._conditioned_agent_mask()
+        self._population_agent_env = np.empty(self.num_agents, dtype=np.int32)
+        for env_idx, (cur, nxt) in enumerate(zip(self.agent_offsets[:-1], self.agent_offsets[1:])):
+            self._population_agent_env[cur:nxt] = env_idx
+        self._population_return = np.zeros(self.num_agents, dtype=np.float32)
+        self._population_discount = np.ones(self.num_agents, dtype=np.float32)
+        self._population_baseline = np.zeros(self.num_agents, dtype=np.float32)
+        self._population_episode_start = np.zeros(self.num_agents, dtype=np.int32)
+        self._population_active = np.zeros(self.num_agents, dtype=bool)
+        self._population_degradation = np.full(self.num_agents, np.nan, dtype=np.float32)
+        self._population_bootstrap_coeff = np.zeros(self.num_agents, dtype=np.float32)
+        self._population_bootstrap_total = np.zeros(self.num_envs, dtype=np.float32)
+
+    def _reset_population_tracking(self):
+        if not self.population_adversary:
+            return
+        self._population_window_score[:] = 0.0
+        self._population_episode_count[:] = 0
+        self._population_return[:] = 0.0
+        self._population_discount[:] = 1.0
+        self._population_active[:] = False
+        self._population_degradation[:] = np.nan
+        self._population_bootstrap_coeff[:] = 0.0
+        self._population_bootstrap_total[:] = 0.0
+
+    def _population_apply_bootstrap(self):
+        """Complete truncated returns once V(next observation) reaches the side channel.
+
+        This must run before map replacement: the supplied values still describe
+        the old scene's final observation, not the reset scene. True terminals
+        have zero continuation value and never receive a coefficient.
+        """
+        if not self.population_adversary:
+            return
+        correction = self._population_bootstrap_coeff * self._policy_values
+        by_env = np.bincount(self._population_agent_env, weights=correction,
+                             minlength=self.num_envs)
+        self._population_window_score -= by_env
+        self._population_bootstrap_total += by_env
+        self._population_bootstrap_coeff[:] = 0.0
+
+    def _sample_population_window(self):
+        if self.population_sampling == "mixture":
+            probabilities, std, version = read_mixture(self._population_mixture)
+            component = self._behavior_rng.choice(5, size=self.num_envs, p=probabilities)
+            mean = population_anchors()[component]
+            self._population_component = component
+            self._population_version = version
+        elif self.population_adversary:
+            mean = np.asarray(self._population_policy_mean, dtype=np.float32)
+            std = float(np.asarray(self._population_policy_std).reshape(-1)[0])
+        else:
+            return
+        self._population_old_mean[:] = mean
+        self._population_sampled_std[:] = std
+        self._population_latent[:] = self._behavior_rng.normal(
+            mean, std, size=(self.num_envs, 12)
+        )
+        alpha, beta, _, _ = latent_to_beta(
+            self._population_latent, self.population_epsilon,
+            self.population_rho_min, self.population_rho_max,
+        )
+        self._population_beta_alpha[:] = alpha
+        self._population_beta_beta[:] = beta
+        self._reset_population_tracking()
+
+    def _population_begin_step(self):
+        if not self.population_adversary:
+            return
+        simple = self._population_simple_mask
+        start = simple & ~self._behavior_done & ~self._population_active
+        self._population_baseline[start] = self._policy_values[start]
+        self._population_episode_start[start] = self.tick
+        self._population_return[start] = 0.0
+        self._population_discount[start] = 1.0
+        self._population_active[start] = True
+
+    def _population_record_step(self, newly_done, done):
+        if not self.population_adversary:
+            return
+        simple_active = self._population_simple_mask & self._population_active
+        self._population_return[simple_active] += (
+            self._population_discount[simple_active]
+            * np.clip(self.rewards[simple_active], -1.0, 1.0)
+        )
+        self._population_discount[simple_active] *= self.population_gamma
+        finished = newly_done & simple_active
+        self._population_degradation[finished] = (
+            self._population_baseline[finished] - self._population_return[finished]
+        )
+        self._population_active[finished] = False
+
+        for env_idx, (cur, nxt) in enumerate(zip(self.agent_offsets[:-1], self.agent_offsets[1:])):
+            if not np.all(done[cur:nxt]):
+                continue
+            simple = self._population_simple_mask[cur:nxt]
+            # xi cannot affect a scene without conditioned agents, and there
+            # is no SimplePPO target signal in a scene without simple agents.
+            if not simple.any() or simple.all():
+                continue
+            values = self._population_degradation[cur:nxt][simple]
+            valid = np.isfinite(values)
+            if not valid.any():
+                continue
+            starts = self._population_episode_start[cur:nxt][simple][valid]
+            start_step = int(starts.min()) if starts.size else self.tick
+            horizon = max(int(self.episode_length or 1), 1)
+            weight = self.population_episode_decay ** (start_step / horizon)
+            self._population_window_score[env_idx] += weight * float(values[valid].mean())
+            # Critic training bootstraps at time limits; a partial Monte Carlo
+            # return alone would turn remaining expected reward into challenge.
+            local_indices = np.arange(cur, nxt)[simple][valid]
+            truncated = finished[local_indices] & (self.truncations[local_indices] > 0) & (self.terminals[local_indices] == 0)
+            indices = local_indices[truncated]
+            self._population_bootstrap_coeff[indices] = (
+                weight * self._population_discount[indices] / int(valid.sum())
+            )
+            self._population_episode_count[env_idx] += 1
+            self._population_degradation[cur:nxt] = np.nan
+
+    def _population_window_records(self):
+        if not self.population_adversary:
+            return []
+        return [
+            {
+                "latent": self._population_latent[i].tolist(),
+                "old_mean": self._population_old_mean[i].tolist(),
+                "old_std": float(self._population_sampled_std[i]),
+                "advantage": float(self._population_window_score[i]),
+                "episode_count": int(self._population_episode_count[i]),
+                "bootstrap_correction": float(self._population_bootstrap_total[i]),
+            }
+            for i in range(self.num_envs)
+            if self._population_episode_count[i] > 0
+        ]
+
     def _sample_behavior_conditions(self, mask=None):
         if not self.behavior_conditioning:
             return
@@ -461,14 +664,29 @@ class Drive(pufferlib.PufferEnv):
         count = int(conditioned.sum())
         if count:
             samples = self.behavior_conditions[conditioned]
-            samples[:, 0] = self._behavior_rng.uniform(0.0, 3.0, count)
-            samples[:, 1] = self._behavior_rng.uniform(0.0, 3.0, count)
-            samples[:, 2] = self._behavior_rng.uniform(0.0, 2.0, count)
-            samples[:, 3] = self._behavior_rng.uniform(0.0, 0.5, count)
-            samples[:, 4] = self._behavior_rng.uniform(20.0, 50.0, count)
-            samples[:, 5] = self._behavior_rng.uniform(
-                0.0, self.behavior_view_angle_max, count
-            )
+            if getattr(self, "population_adversary", False) or getattr(self, "population_sampling", "legacy") == "mixture":
+                env_ids = self._population_agent_env[conditioned]
+                unit = np.empty_like(samples)
+                for env_idx in np.unique(env_ids):
+                    local = env_ids == env_idx
+                    unit[local] = self._behavior_rng.beta(
+                        self._population_beta_alpha[env_idx],
+                        self._population_beta_beta[env_idx],
+                        size=(int(local.sum()), 6),
+                    )
+                scale = np.asarray((3.0, 3.0, 2.0, 0.5, 30.0,
+                                    self.behavior_view_angle_max), dtype=np.float32)
+                offset = np.asarray((0.0, 0.0, 0.0, 0.0, 20.0, 0.0), dtype=np.float32)
+                samples[:] = offset + scale * unit
+            else:
+                samples[:, 0] = self._behavior_rng.uniform(0.0, 3.0, count)
+                samples[:, 1] = self._behavior_rng.uniform(0.0, 3.0, count)
+                samples[:, 2] = self._behavior_rng.uniform(0.0, 2.0, count)
+                samples[:, 3] = self._behavior_rng.uniform(0.0, 0.5, count)
+                samples[:, 4] = self._behavior_rng.uniform(20.0, 50.0, count)
+                samples[:, 5] = self._behavior_rng.uniform(
+                    0.0, self.behavior_view_angle_max, count
+                )
             self.behavior_conditions[conditioned] = samples
 
     def _write_behavior_conditions(self):
@@ -535,6 +753,7 @@ class Drive(pufferlib.PufferEnv):
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
+        self._initialize_population_window()
         env_ids = []
         seed = np.random.randint(0, 2**32 - 1)
         for i in range(num_envs):
@@ -576,6 +795,7 @@ class Drive(pufferlib.PufferEnv):
                 offroad_behavior=self.offroad_behavior,
                 dt=self.dt,
                 episode_length=(int(self.episode_length) if self.episode_length is not None else None),
+                termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
                 max_controlled_agents=self.max_controlled_agents,
                 idm_others=int(self.idm_others),
                 map_id=map_ids[i],
@@ -599,25 +819,47 @@ class Drive(pufferlib.PufferEnv):
         binding.vec_reset(self.c_envs, seed)
         self.terminals[:] = 1
         self._behavior_done[:] = False
+        self._sample_population_window()
         self._sample_behavior_conditions()
         self._write_behavior_conditions()
 
     def step(self, actions):
 
+        self._population_apply_bootstrap()
         self.terminals[:] = 0
         self.truncations[:] = 0
         self.actions[:] = actions
         # reset environment, if resample_frequency is reached, you do not need to step in this case!
         if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
+            population_records = self._population_window_records()
+            mixture_info = None
+            if self.population_sampling == "mixture":
+                mixture_info = {"population_mixture": {
+                    "version": self._population_version,
+                    "windows": self.num_envs,
+                    **{f"component_{k}_fraction": float((self._population_component == k).mean())
+                       for k in range(5)}}}
             self.resample_maps()
-            info = []
+            info = ([{"population_adversary_samples": population_records}]
+                    if population_records else [])
+            if mixture_info is not None:
+                info.append(mixture_info)
 
         else:
+            self._population_begin_step()
             binding.vec_step(self.c_envs) # truncations and terminals get set in here as well.
             self.tick += 1
             self._shape_behavior_rewards()
+            at_window_boundary = (
+                self.tick > 0
+                and self.resample_frequency > 0
+                and self.tick % self.resample_frequency == 0
+            )
+            if self.population_adversary and at_window_boundary:
+                self.truncations[:] = 1.0
             done = (self.terminals > 0) | (self.truncations > 0)
             newly_done = done & ~self._behavior_done
+            self._population_record_step(newly_done, done)
             self._sample_behavior_conditions(newly_done)
             self._behavior_done[:] = done
             self._write_behavior_conditions()
@@ -636,11 +878,10 @@ class Drive(pufferlib.PufferEnv):
                         }
                     info.append(log)
                     # print(log)
-            if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0: # self.tick just got increased!
-                self.truncations[:] = 1.0 # truncations are the ones which are after time out right??
-
-            
-
+            # Preserve the original ordering/RNG behavior when the optional
+            # population adversary is disabled.
+            if not self.population_adversary and at_window_boundary:
+                self.truncations[:] = 1.0
         return (self.observations, self.rewards, self.terminals, self.truncations, info)
 
     # User-facing creward fields. `delta_goal` defaults to 0 (sentinel meaning

@@ -8,6 +8,8 @@
 # TODO: Check actions passed to envs are right shape? On first call at least
 
 
+from pufferlib.population_adversary import mixture_payload, publish_mixture
+
 import numpy as np
 import time
 import psutil
@@ -78,7 +80,27 @@ class Serial:
         self.observation_space = pufferlib.spaces.joint_space(self.single_observation_space, self.agents_per_batch)
 
         set_buffers(self, buf)
+        self.policy_values = (
+            buf["policy_values"] if buf is not None and "policy_values" in buf
+            else np.zeros(self.num_agents, dtype=np.float32)
+        )
+        if buf is not None and "population_policy_mean" in buf:
+            self.population_policy_mean = buf["population_policy_mean"]
+            self.population_policy_std = buf["population_policy_std"]
+            shared_population_policy = True
+        else:
+            self.population_policy_mean = np.tile(
+                getattr(self.driver_env, "population_initial_mean", np.zeros(12, dtype=np.float32)),
+                (num_envs, 1),
+            )
+            self.population_policy_std = np.full(
+                num_envs, getattr(self.driver_env, "population_std_start", 0.5), dtype=np.float32
+            )
+            shared_population_policy = False
 
+        self.population_mixture = (buf["population_mixture"]
+            if buf is not None and "population_mixture" in buf else np.tile(
+                mixture_payload(getattr(self.driver_env, "population_descriptor_std", .35)), (num_envs, 1)))
         self.envs = []
         ptr = 0
         for i in range(num_envs):
@@ -90,6 +112,15 @@ class Serial:
                 truncations=self.truncations[ptr:end],
                 masks=self.masks[ptr:end],
                 actions=self.actions[ptr:end],
+                policy_values=self.policy_values[ptr:end],
+                population_mixture=(self.population_mixture if shared_population_policy
+                                    else self.population_mixture[i]),
+                population_policy_mean=(self.population_policy_mean
+                                        if shared_population_policy
+                                        else self.population_policy_mean[i]),
+                population_policy_std=(self.population_policy_std
+                                       if shared_population_policy
+                                       else self.population_policy_std[i:i + 1]),
             )
             ptr = end
             seed_i = seed + i if seed is not None else None
@@ -104,6 +135,18 @@ class Serial:
         self.agent_ids = np.arange(self.num_agents)
         self.initialized = False
         self.flag = RESET
+
+    def set_policy_values(self, values):
+        np.copyto(self.policy_values, np.asarray(values, dtype=np.float32))
+
+    def set_population_policy(self, mean, std):
+        self.population_policy_mean[:] = np.asarray(mean, dtype=np.float32)
+        self.population_policy_std[:] = float(std)
+
+    def set_population_mixture(self, probabilities, std, version):
+        targets = self.population_mixture.reshape(-1, 8)
+        for target in targets:
+            publish_mixture(target, probabilities, std, version)
 
     def _avg_infos(self):
         infos = {}
@@ -214,6 +257,13 @@ def _worker_process(
         truncations=np.ndarray(shape, dtype=bool, buffer=shm["truncateds"])[worker_idx],
         masks=np.ndarray(shape, dtype=bool, buffer=shm["masks"])[worker_idx],
         actions=atn_arr,
+        policy_values=np.ndarray(shape, dtype=np.float32, buffer=shm["policy_values"])[worker_idx],
+        population_mixture=np.ndarray((num_workers, 8), dtype=np.float64,
+                                      buffer=shm["population_mixture"])[worker_idx],
+        population_policy_mean=np.ndarray((num_workers, 12), dtype=np.float32,
+                                          buffer=shm["population_policy_mean"])[worker_idx],
+        population_policy_std=np.ndarray(num_workers, dtype=np.float32,
+                                         buffer=shm["population_policy_std"])[worker_idx:worker_idx + 1],
     )
     buf["masks"][:] = True
 
@@ -356,6 +406,10 @@ class Multiprocessing:
             masks=RawArray("b", num_agents),
             semaphores=RawArray("c", num_workers),
             notify=RawArray("b", num_workers),
+            policy_values=RawArray("f", num_agents),
+            population_mixture=RawArray("d", num_workers * 8),
+            population_policy_mean=RawArray("f", num_workers * 12),
+            population_policy_std=RawArray("f", num_workers),
         )
         shape = (num_workers, agents_per_worker)
         self.obs_batch_shape = (self.agents_per_batch, *obs_shape)
@@ -369,7 +423,22 @@ class Multiprocessing:
             masks=np.ndarray(shape, dtype=bool, buffer=self.shm["masks"]),
             semaphores=np.ndarray(num_workers, dtype=np.uint8, buffer=self.shm["semaphores"]),
             notify=np.ndarray(num_workers, dtype=bool, buffer=self.shm["notify"]),
+            policy_values=np.ndarray(shape, dtype=np.float32, buffer=self.shm["policy_values"]),
+            population_mixture=np.ndarray((num_workers, 8), dtype=np.float64,
+                                         buffer=self.shm["population_mixture"]),
+            population_policy_mean=np.ndarray((num_workers, 12), dtype=np.float32,
+                                              buffer=self.shm["population_policy_mean"]),
+            population_policy_std=np.ndarray(num_workers, dtype=np.float32,
+                                             buffer=self.shm["population_policy_std"]),
         )
+        self.buf["population_policy_mean"][:] = getattr(
+            driver_env, "population_initial_mean", np.zeros(12, dtype=np.float32)
+        )
+        self.buf["population_policy_std"][:] = getattr(
+            driver_env, "population_std_start", 0.5
+        )
+        self.buf["population_mixture"][:] = mixture_payload(
+            getattr(driver_env, "population_descriptor_std", .35))
         self.buf["semaphores"][:] = MAIN
 
         from multiprocessing import Pipe, Process
@@ -511,6 +580,18 @@ class Multiprocessing:
         idxs = self.w_slice
         self.actions[idxs] = actions
         self.buf["semaphores"][idxs] = STEP
+
+    def set_policy_values(self, values):
+        target = self.buf["policy_values"][self.w_slice]
+        target[:] = np.asarray(values, dtype=np.float32).reshape(target.shape)
+
+    def set_population_mixture(self, probabilities, std, version):
+        for target in self.buf["population_mixture"]:
+            publish_mixture(target, probabilities, std, version)
+
+    def set_population_policy(self, mean, std):
+        self.buf["population_policy_mean"][:] = np.asarray(mean, dtype=np.float32)
+        self.buf["population_policy_std"][:] = float(std)
 
     def async_reset(self, seed=0):
         # Flush any waiting workers
