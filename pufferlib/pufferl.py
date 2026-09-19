@@ -20,6 +20,8 @@ import glob
 import ast
 import time
 import random
+import csv
+import json
 import shutil
 import subprocess
 import argparse
@@ -437,6 +439,12 @@ class PuffeRL:
         self.population_sample_count = 0
         self.population_policy = None
         self.population_optimizer = None
+        # Optional trainer-side audit.  It is intentionally off by default and
+        # only observes the exact records consumed by q_phi; workers never do
+        # filesystem I/O for it.
+        monitor_dir = str(config.get("population_monitor_dir", "")).strip()
+        self.population_monitor_dir = Path(monitor_dir) if monitor_dir else None
+        self.population_update_count = 0
         if self.population_adversary:
             if not self.mix_ppo or self.mix_ppo_sampling != "stratified":
                 raise pufferlib.APIUsageError(
@@ -455,6 +463,81 @@ class PuffeRL:
                 lr=float(config.get("population_learning_rate", 3e-4)),
             )
             self._sync_population_policy()
+
+    def _write_population_monitor(self, records, raw_advantage, advantage,
+                                  correlation, update_index):
+        """Append an opt-in, lossless q_phi audit for one population update."""
+        if self.population_monitor_dir is None:
+            return
+        directory = self.population_monitor_dir
+        directory.mkdir(parents=True, exist_ok=True)
+
+        latent = np.asarray([r["latent"] for r in records], dtype=np.float64)
+        old_mean = np.asarray([r["old_mean"] for r in records], dtype=np.float64)
+        old_std = np.asarray([r["old_std"] for r in records], dtype=np.float64)
+        _, _, beta_mean, beta_rho = latent_to_beta(
+            latent,
+            float(self.config.get("population_epsilon", 0.02)),
+            float(self.config.get("population_rho_min", 0.02)),
+            float(self.config.get("population_rho_max", 0.5)),
+        )
+        record_path = directory / "records.csv"
+        fields = (["update", "record", "q_reward_raw", "q_reward_z", "episode_count",
+                   "bootstrap_correction", "old_std"]
+                  + [f"latent_{i}" for i in range(latent.shape[1])]
+                  + [f"old_mean_{i}" for i in range(old_mean.shape[1])]
+                  + [f"beta_mean_{i}" for i in range(beta_mean.shape[1])]
+                  + [f"beta_rho_{i}" for i in range(beta_rho.shape[1])])
+        new_file = not record_path.exists()
+        with record_path.open("a", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            if new_file:
+                writer.writeheader()
+            for index, record in enumerate(records):
+                row = {
+                    "update": update_index,
+                    "record": index,
+                    "q_reward_raw": float(raw_advantage[index].item()),
+                    "q_reward_z": float(advantage[index].item()),
+                    "episode_count": int(record["episode_count"]),
+                    "bootstrap_correction": float(record.get("bootstrap_correction", 0.0)),
+                    "old_std": float(old_std[index]),
+                }
+                row.update({f"latent_{i}": float(value) for i, value in enumerate(latent[index])})
+                row.update({f"old_mean_{i}": float(value) for i, value in enumerate(old_mean[index])})
+                row.update({f"beta_mean_{i}": float(value) for i, value in enumerate(beta_mean[index])})
+                row.update({f"beta_rho_{i}": float(value) for i, value in enumerate(beta_rho[index])})
+                writer.writerow(row)
+
+        # The sixth descriptor is the normalized view-angle distribution.  The
+        # four bins expose whether low-view actions receive a consistently
+        # different immediate q reward, without assuming an angle scale here.
+        view = beta_mean[:, 5]
+        bins = []
+        for lo, hi in zip((0.0, 0.25, 0.5, 0.75), (0.25, 0.5, 0.75, 1.0)):
+            mask = (view >= lo) & ((view < hi) if hi < 1.0 else (view <= hi))
+            bins.append({
+                "range": [lo, hi],
+                "count": int(mask.sum()),
+                "q_reward_mean": (float(raw_advantage[mask].mean().item())
+                                    if mask.any() else None),
+                "q_reward_z_mean": (float(advantage[mask].mean().item())
+                                      if mask.any() else None),
+            })
+        summary = {
+            "update": update_index,
+            "records": len(records),
+            "q_reward_mean": float(raw_advantage.mean().item()),
+            "q_reward_std": float(raw_advantage.std(unbiased=False).item()),
+            "exploration_std": float(old_std.mean()),
+            "correlation": [float(value) for value in correlation.detach().cpu().tolist()],
+            "view_mu_correlation": float(correlation[5].item()),
+            "view_rho_correlation": float(correlation[11].item()),
+            "view_mu_mean": float(view.mean()),
+            "view_bins": bins,
+        }
+        with (directory / "updates.jsonl").open("a") as handle:
+            handle.write(json.dumps(summary, sort_keys=True) + "\n")
 
     def _population_std(self):
         return cosine_exploration_std(
@@ -525,6 +608,11 @@ class PuffeRL:
             # Correlation, not raw challenge magnitude, indicates a search direction.
             centered = residual - residual.mean(0)
             correlation = (centered * advantage[:, None]).mean(0) / centered.square().mean(0).sqrt().clamp_min(1e-8)
+        self.population_update_count += 1
+        self._write_population_monitor(
+            records, raw_advantage, advantage, correlation,
+            self.population_update_count,
+        )
         losses, clipfracs = [], []
         optimizer_steps = 0
         for _ in range(epochs):

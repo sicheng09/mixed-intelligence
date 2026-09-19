@@ -212,6 +212,49 @@ def test_population_window_reward_is_discounted_sum_not_time_average():
     assert env._population_episode_count[0] == 1
 
 
+def test_population_first_episode_mode_ignores_later_cohorts_without_decay():
+    env = Drive.__new__(Drive)
+    env.population_adversary = True
+    env.population_reward_mode = "first_episode"
+    env.population_gamma = 0.5
+    env.population_episode_decay = 0.8
+    env.episode_length = 10
+    env.num_agents = 3
+    env.num_envs = 1
+    env.agent_offsets = np.asarray([0, 3])
+    env.policy_log_ids = [0, 0, 1]
+    env.behavior_conditioned_policy_id = 1
+    env._population_simple_mask = np.asarray([True, True, False])
+    env._population_return = np.zeros(3, dtype=np.float32)
+    env._population_discount = np.ones(3, dtype=np.float32)
+    env._population_baseline = np.asarray([1.0, 1.0, 0.0], dtype=np.float32)
+    env._population_episode_start = np.asarray([10, 10, 10], dtype=np.int32)
+    env._population_active = np.asarray([True, True, False])
+    env._population_degradation = np.full(3, np.nan, dtype=np.float32)
+    env._population_window_score = np.zeros(1, dtype=np.float32)
+    env._population_episode_count = np.zeros(1, dtype=np.int32)
+    env._population_bootstrap_coeff = np.zeros(3, dtype=np.float32)
+    env.terminals = np.ones(3, dtype=np.float32)
+    env.truncations = np.zeros(3, dtype=np.float32)
+    done = np.ones(3, dtype=bool)
+
+    env.rewards = np.asarray([0.5, 0.0, 100.0], dtype=np.float32)
+    env._population_record_step(done, done)
+    # First cohort: mean(V-G)=.75, with no legacy time decay.
+    assert np.isclose(env._population_window_score[0], .75)
+    assert env._population_episode_count[0] == 1
+
+    env._population_active[:] = [True, True, False]
+    env._population_return[:] = 0.
+    env._population_discount[:] = 1.
+    env._population_baseline[:] = [3., 3., 0.]
+    env._population_episode_start[:] = 20
+    env.rewards = np.asarray([0., 0., 0.], dtype=np.float32)
+    env._population_record_step(done, done)
+    assert np.isclose(env._population_window_score[0], .75)
+    assert env._population_episode_count[0] == 1
+
+
 def _population_test_trainer(chunk_size=64, target_kl=0.03):
     from pufferlib.pufferl import PuffeRL
     trainer = PuffeRL.__new__(PuffeRL)

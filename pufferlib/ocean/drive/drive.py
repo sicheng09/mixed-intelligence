@@ -99,6 +99,7 @@ class Drive(pufferlib.PufferEnv):
         population_adversary=False,  # Learn the distribution of behavior conditions
         population_gamma=0.98,
         population_episode_decay=0.8,
+        population_reward_mode="legacy_window",
         population_epsilon=0.02,
         population_rho_min=0.02,
         population_rho_max=0.5,
@@ -183,6 +184,9 @@ class Drive(pufferlib.PufferEnv):
         self.population_adversary = self._as_bool(population_adversary)
         self.population_gamma = float(population_gamma)
         self.population_episode_decay = float(population_episode_decay)
+        self.population_reward_mode = str(population_reward_mode).strip().lower()
+        if self.population_reward_mode not in ("legacy_window", "first_episode"):
+            raise ValueError("population_reward_mode must be legacy_window or first_episode")
         self.population_epsilon = float(population_epsilon)
         self.population_rho_min = float(population_rho_min)
         self.population_rho_max = float(population_rho_max)
@@ -619,10 +623,19 @@ class Drive(pufferlib.PufferEnv):
             valid = np.isfinite(values)
             if not valid.any():
                 continue
+            # The first-episode target deliberately ignores every later reset
+            # under this descriptor.  It preserves the legacy default and all
+            # environment/PPO behavior; only the q record changes.
+            if (getattr(self, "population_reward_mode", "legacy_window") == "first_episode"
+                    and self._population_episode_count[env_idx] > 0):
+                self._population_degradation[cur:nxt] = np.nan
+                continue
             starts = self._population_episode_start[cur:nxt][simple][valid]
             start_step = int(starts.min()) if starts.size else self.tick
             horizon = max(int(self.episode_length or 1), 1)
-            weight = self.population_episode_decay ** (start_step / horizon)
+            # V_start-G for the first cohort has no within-window time decay.
+            weight = (1.0 if getattr(self, "population_reward_mode", "legacy_window") == "first_episode"
+                      else self.population_episode_decay ** (start_step / horizon))
             self._population_window_score[env_idx] += weight * float(values[valid].mean())
             # Critic training bootstraps at time limits; a partial Monte Carlo
             # return alone would turn remaining expected reward into challenge.
