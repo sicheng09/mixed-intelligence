@@ -94,6 +94,7 @@ class Drive(pufferlib.PufferEnv):
         behavior_conditioning=False,  # Try1 six-dimensional behavior condition
         behavior_conditioned_policy_id=1,
         behavior_view_angle_max=180.0,  # Maximum sampled view angle in degrees
+        behavior_view_sampling="continuous",  # continuous or discrete_caps
         population_sampling="legacy",
         population_descriptor_std=0.35,
         population_adversary=False,  # Learn the distribution of behavior conditions
@@ -170,6 +171,9 @@ class Drive(pufferlib.PufferEnv):
         self.behavior_view_angle_max = float(behavior_view_angle_max)
         if not np.isfinite(self.behavior_view_angle_max) or not 0.0 < self.behavior_view_angle_max <= 360.0:
             raise ValueError("behavior_view_angle_max must be in (0, 360] degrees")
+        self.behavior_view_sampling = str(behavior_view_sampling).strip().lower()
+        if self.behavior_view_sampling not in ("continuous", "discrete_caps"):
+            raise ValueError("behavior_view_sampling must be continuous or discrete_caps")
         self.behavior_condition_features = 6 if self.behavior_conditioning else 0
         self._behavior_seed = int(seed)
         self.population_sampling = population_sampling
@@ -691,6 +695,17 @@ class Drive(pufferlib.PufferEnv):
                                     self.behavior_view_angle_max), dtype=np.float32)
                 offset = np.asarray((0.0, 0.0, 0.0, 0.0, 20.0, 0.0), dtype=np.float32)
                 samples[:] = offset + scale * unit
+                if self.behavior_view_sampling == "discrete_caps":
+                    # The sixth Beta now describes a categorical *view cap*,
+                    # not an angle.  With Beta(1, 1), its four equal-width
+                    # bins select 90/180/270/360 degrees uniformly.  The
+                    # actual angle is then uniform in [0, cap], matching the
+                    # cap-mixture protocol while retaining the existing
+                    # per-environment q descriptor and IPC layout.
+                    cap_index = np.minimum((unit[:, 5] * 4.0).astype(np.int32), 3)
+                    caps = (cap_index + 1).astype(np.float32) * (
+                        self.behavior_view_angle_max / 4.0)
+                    samples[:, 5] = self._behavior_rng.uniform(0.0, 1.0, count) * caps
             else:
                 samples[:, 0] = self._behavior_rng.uniform(0.0, 3.0, count)
                 samples[:, 1] = self._behavior_rng.uniform(0.0, 3.0, count)
