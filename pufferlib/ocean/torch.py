@@ -261,6 +261,10 @@ class DriveBehaviorConditioned(nn.Module):
         self.behavior_view_angle_max = float(
             getattr(env, "behavior_view_angle_max", 180.0)
         )
+        self.behavior_radius_max = float(getattr(env, "behavior_radius_max", 50.0))
+        self.behavior_radius_sampling = str(
+            getattr(env, "behavior_radius_sampling", "continuous")
+        ).strip().lower()
 
         def encoder(in_features):
             return nn.Sequential(
@@ -297,7 +301,10 @@ class DriveBehaviorConditioned(nn.Module):
         return self.forward(observations, state)
 
     def apply_partner_mask(self, partner_objects, condition):
-        radius = 20.0 + 15.0 * (condition[:, 4] + 1.0)
+        if self.behavior_radius_sampling == "discrete_caps":
+            radius = 0.5 * self.behavior_radius_max * (condition[:, 4] + 1.0)
+        else:
+            radius = 20.0 + 0.5 * (self.behavior_radius_max - 20.0) * (condition[:, 4] + 1.0)
         view_angle = (
             0.5 * torch.pi * (condition[:, 5] + 1.0)
             * (self.behavior_view_angle_max / 180.0)

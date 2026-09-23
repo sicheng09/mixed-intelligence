@@ -93,6 +93,8 @@ class Drive(pufferlib.PufferEnv):
         policy_log_count=0,
         behavior_conditioning=False,  # Try1 six-dimensional behavior condition
         behavior_conditioned_policy_id=1,
+        behavior_radius_max=50.0,  # Maximum sampled partner-perception radius in meters
+        behavior_radius_sampling="continuous",  # continuous or discrete_caps
         behavior_view_angle_max=180.0,  # Maximum sampled view angle in degrees
         behavior_view_sampling="continuous",  # continuous or discrete_caps
         population_sampling="legacy",
@@ -168,6 +170,14 @@ class Drive(pufferlib.PufferEnv):
         self.policy_log_count = int(policy_log_count or 0)
         self.behavior_conditioning = self._as_bool(behavior_conditioning)
         self.behavior_conditioned_policy_id = int(behavior_conditioned_policy_id)
+        self.behavior_radius_max = float(behavior_radius_max)
+        if not np.isfinite(self.behavior_radius_max) or self.behavior_radius_max <= 0.0:
+            raise ValueError("behavior_radius_max must be positive")
+        self.behavior_radius_sampling = str(behavior_radius_sampling).strip().lower()
+        if self.behavior_radius_sampling not in ("continuous", "discrete_caps"):
+            raise ValueError("behavior_radius_sampling must be continuous or discrete_caps")
+        if self.behavior_radius_sampling == "continuous" and self.behavior_radius_max <= 20.0:
+            raise ValueError("continuous behavior_radius_max must exceed 20m")
         self.behavior_view_angle_max = float(behavior_view_angle_max)
         if not np.isfinite(self.behavior_view_angle_max) or not 0.0 < self.behavior_view_angle_max <= 360.0:
             raise ValueError("behavior_view_angle_max must be in (0, 360] degrees")
@@ -691,10 +701,21 @@ class Drive(pufferlib.PufferEnv):
                         self._population_beta_beta[env_idx],
                         size=(int(local.sum()), 6),
                     )
-                scale = np.asarray((3.0, 3.0, 2.0, 0.5, 30.0,
+                radius_offset = 0.0 if self.behavior_radius_sampling == "discrete_caps" else 20.0
+                radius_scale = (self.behavior_radius_max if self.behavior_radius_sampling == "discrete_caps"
+                                else self.behavior_radius_max - radius_offset)
+                scale = np.asarray((3.0, 3.0, 2.0, 0.5, radius_scale,
                                     self.behavior_view_angle_max), dtype=np.float32)
-                offset = np.asarray((0.0, 0.0, 0.0, 0.0, 20.0, 0.0), dtype=np.float32)
+                offset = np.asarray((0.0, 0.0, 0.0, 0.0, radius_offset, 0.0), dtype=np.float32)
                 samples[:] = offset + scale * unit
+                if self.behavior_radius_sampling == "discrete_caps":
+                    # The fifth Beta selects a radius cap in {max/4, max/2,
+                    # 3max/4, max}; the actual partner-perception radius is
+                    # uniform in [0, cap].
+                    cap_index = np.minimum((unit[:, 4] * 4.0).astype(np.int32), 3)
+                    caps = (cap_index + 1).astype(np.float32) * (
+                        self.behavior_radius_max / 4.0)
+                    samples[:, 4] = self._behavior_rng.uniform(0.0, 1.0, count) * caps
                 if self.behavior_view_sampling == "discrete_caps":
                     # The sixth Beta now describes a categorical *view cap*,
                     # not an angle.  With Beta(1, 1), its four equal-width
@@ -726,7 +747,10 @@ class Drive(pufferlib.PufferEnv):
         normalized[:, 1] = 2.0 * values[:, 1] / 3.0 - 1.0
         normalized[:, 2] = values[:, 2] - 1.0
         normalized[:, 3] = 4.0 * values[:, 3] - 1.0
-        normalized[:, 4] = 2.0 * (values[:, 4] - 20.0) / 30.0 - 1.0
+        if self.behavior_radius_sampling == "discrete_caps":
+            normalized[:, 4] = 2.0 * values[:, 4] / self.behavior_radius_max - 1.0
+        else:
+            normalized[:, 4] = 2.0 * (values[:, 4] - 20.0) / (self.behavior_radius_max - 20.0) - 1.0
         normalized[:, 5] = 2.0 * values[:, 5] / self.behavior_view_angle_max - 1.0
         tail_start = self.num_obs - self.behavior_condition_features
         self.observations[:, tail_start:tail_start + self.behavior_condition_features] = normalized
