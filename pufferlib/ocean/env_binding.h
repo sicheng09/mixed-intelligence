@@ -1128,6 +1128,9 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "EGO_FEATURES_JERK", EGO_FEATURES_JERK);
     PyModule_AddIntConstant(m, "CREWARD_FEATURES", CREWARD_FEATURES);
     PyModule_AddIntConstant(m, "GLOBAL_STATE_FEATURES", GLOBAL_STATE_FEATURES);
+#ifdef SEEDED_SHARED
+    PyModule_AddIntConstant(m, "SEEDED_SHARED", SEEDED_SHARED);
+#endif
 
     return m;
 }

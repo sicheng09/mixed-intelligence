@@ -97,6 +97,21 @@ def _as_bool(value):
     return bool(value)
 
 
+def _seed_everything(seed, deterministic=False):
+    """Seed the host and accelerator RNGs before creating envs or policies."""
+    seed = int(seed)
+    # This must be set before the first CUDA matrix operation. It makes cuBLAS
+    # select a deterministic workspace when deterministic mode is requested.
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _split_csv(value):
     if value is None or value == "":
         return []
@@ -158,19 +173,19 @@ class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
         # Backend perf optimization
         torch.set_float32_matmul_precision("high")
-        torch.backends.cudnn.deterministic = config["torch_deterministic"]
-        torch.backends.cudnn.benchmark = True
+        if _as_bool(config.get("reproducibility", False)):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.use_deterministic_algorithms(True)
+        else:
+            torch.backends.cudnn.deterministic = config["torch_deterministic"]
+            torch.backends.cudnn.benchmark = True
 
         # DDP rank (0 when not using torchrun). Used to gate rank-0-only side effects.
         self._ddp_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-        # Reproducibility
-        seed = config["seed"]
-        # random.seed(seed)
-        # np.random.seed(seed)
-        # torch.manual_seed(seed)
-
         # Vecenv info
+        seed = config["seed"]
         vecenv.async_reset(seed)
         obs_space = vecenv.single_observation_space
         atn_space = vecenv.single_action_space
@@ -2564,9 +2579,15 @@ class WandbLogger:
 
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
-    if args["train"].get("population_mode", "legacy") != "legacy":
-        np.random.seed(int(args["train"]["seed"]))
-        torch.manual_seed(int(args["train"]["seed"]))
+    reproducibility = _as_bool(args["train"].get("reproducibility", False))
+    previous_deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
+    if reproducibility:
+        _seed_everything(args["train"]["seed"], deterministic=True)
+    else:
+        if args["train"].get("population_mode", "legacy") != "legacy":
+            # Preserve the pre-existing population-mode seeding behavior.
+            np.random.seed(int(args["train"]["seed"]))
+            torch.manual_seed(int(args["train"]["seed"]))
     # Default to "training" split if not overridden via --env.split
     if "split" not in args.get("env", {}):
         args["env"]["split"] = "training"
@@ -2707,6 +2728,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     pufferl.print_dashboard()
     model_path = pufferl.close()
     pufferl.logger.close(model_path)
+    if reproducibility:
+        torch.use_deterministic_algorithms(previous_deterministic_algorithms)
     return all_logs
 
 
@@ -3087,6 +3110,9 @@ def load_env(env_name, args):
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
     env_kwargs = dict(args["env"])
+    reproducibility = _as_bool(args.get("train", {}).get("reproducibility", False))
+    if reproducibility and package == "ocean" and env_name == "puffer_drive":
+        env_kwargs["reproducible"] = True
     mode = args.get("train", {}).get("population_mode", "legacy")
     if mode not in ("legacy", "uniform", "fixed", "adaptive"):
         raise ValueError("population_mode must be legacy, uniform, fixed or adaptive")
@@ -3114,7 +3140,10 @@ def load_env(env_name, args):
         env_kwargs["policy_log_ids"] = local_policy_ids
         env_kwargs["policy_log_count"] = len(fractions)
         args["train"]["mix_ppo_local_policy_ids"] = local_policy_ids
-    return pufferlib.vector.make(make_env, env_kwargs=env_kwargs, **args["vec"])
+    vec_args = dict(args["vec"])
+    if reproducibility:
+        vec_args["reproducible"] = True
+    return pufferlib.vector.make(make_env, env_kwargs=env_kwargs, **vec_args)
 
 
 def load_policy(args, vecenv, env_name=""):

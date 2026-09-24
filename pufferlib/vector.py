@@ -8,11 +8,13 @@
 # TODO: Check actions passed to envs are right shape? On first call at least
 
 
-from pufferlib.population_adversary import mixture_payload, publish_mixture
-
-import numpy as np
+import random
 import time
 import psutil
+
+import numpy as np
+
+from pufferlib.population_adversary import mixture_payload, publish_mixture
 
 from pufferlib.emulation import GymnasiumPufferEnv, PettingZooPufferEnv
 from pufferlib import PufferEnv, set_buffers
@@ -69,7 +71,11 @@ class Serial:
     def num_envs(self):
         return self.agents_per_batch
 
-    def __init__(self, env_creators, env_args, env_kwargs, num_envs, buf=None, seed=0, **kwargs):
+    def __init__(
+        self, env_creators, env_args, env_kwargs, num_envs,
+        buf=None, seed=0, reproducible=False, **kwargs,
+    ):
+        self.reproducible = reproducible
         self.driver_env = env_creators[0](*env_args[0], **env_kwargs[0])
         self.agents_per_batch = self.driver_env.num_agents * num_envs
         self.num_agents = self.agents_per_batch
@@ -169,6 +175,9 @@ class Serial:
     def async_reset(self, seed=None):
         self.flag = RECV
         infos = []
+        if seed is not None and self.reproducible:
+            random.seed(seed)
+            np.random.seed(seed)
         for i, env in enumerate(self.envs):
             if seed is None:
                 ob, i = env.reset()
@@ -246,6 +255,7 @@ def _worker_process(
     shm,
     is_native,
     seed,
+    reproducible,
 ):
     # Environments read and write directly to shared memory
     shape = (num_workers, num_envs * num_agents)
@@ -270,7 +280,10 @@ def _worker_process(
     if is_native and num_envs == 1:
         envs = env_creators[0](*env_args[0], **env_kwargs[0], buf=buf, seed=seed)
     else:
-        envs = Serial(env_creators, env_args, env_kwargs, num_envs, buf=buf, seed=seed * num_envs)
+        envs = Serial(
+            env_creators, env_args, env_kwargs, num_envs,
+            buf=buf, seed=seed * num_envs, reproducible=reproducible,
+        )
 
     semaphores = np.ndarray(num_workers, dtype=np.uint8, buffer=shm["semaphores"])
     notify = np.ndarray(num_workers, dtype=bool, buffer=shm["notify"])
@@ -289,6 +302,9 @@ def _worker_process(
         start = time.time()
         if sem == RESET:
             seed = recv_pipe.recv()
+            if reproducible:
+                random.seed(seed)
+                np.random.seed(seed)
             _, infos = envs.reset(seed=seed)
         elif sem == STEP:
             _, _, _, _, infos = envs.step(atn_arr)
@@ -329,6 +345,7 @@ class Multiprocessing:
         sync_traj=True,
         overwork=False,
         seed=0,
+        reproducible=False,
         **kwargs,
     ):
         if batch_size is None:
@@ -361,6 +378,7 @@ class Multiprocessing:
         self.workers_per_batch = batch_size // envs_per_worker
         self.num_workers = num_workers
         self.num_timed_out = 0
+        self.reproducible = reproducible
 
         # I really didn't want to need a driver process... with mp.shared_memory
         # we can fetch this data from the worker processes and ever perform
@@ -471,6 +489,7 @@ class Multiprocessing:
                     self.shm,
                     is_native,
                     seed_i,
+                    reproducible,
                 ),
             )
             p.start()
@@ -617,8 +636,8 @@ class Multiprocessing:
         self.buf["semaphores"][:] = RESET
         for i in range(self.num_workers):
             start = i * self.envs_per_worker
-            end = (i + 1) * self.envs_per_worker
-            self.send_pipes[i].send(seed + i)
+            reset_seed = seed + start if self.reproducible else seed + i
+            self.send_pipes[i].send(reset_seed)
 
     def notify(self):
         self.buf["notify"][:] = True
@@ -671,16 +690,23 @@ class Ray:
     reset = reset
     step = step
 
-    def __init__(self, env_creators, env_args, env_kwargs, num_envs, num_workers=None, batch_size=None, **kwargs):
+    def __init__(
+        self, env_creators, env_args, env_kwargs, num_envs,
+        num_workers=None, batch_size=None, seed=0, reproducible=False, **kwargs,
+    ):
         if batch_size is None:
             batch_size = num_envs
         if num_workers is None:
             num_workers = num_envs
 
         self.env_pool = num_envs != batch_size
+        if reproducible:
+            self.env_pool = True
         envs_per_worker = num_envs // num_workers
         self.workers_per_batch = batch_size // envs_per_worker
         self.num_workers = num_workers
+        self.envs_per_worker = envs_per_worker
+        self.reproducible = reproducible
 
         driver_env = env_creators[0](*env_args[0], **env_kwargs[0])
         self.driver_env = driver_env
@@ -720,7 +746,9 @@ class Ray:
             end = start + envs_per_worker
             self.envs.append(
                 ray.remote(Serial).remote(
-                    env_creators[start:end], env_args[start:end], env_kwargs[start:end], envs_per_worker
+                    env_creators[start:end], env_args[start:end], env_kwargs[start:end], envs_per_worker,
+                    seed=(seed + start if reproducible else 0),
+                    reproducible=reproducible,
                 )
             )
 
@@ -778,7 +806,10 @@ class Ray:
 
         handles = []
         for idx, e in enumerate(self.envs):
-            e.async_reset.remote(**kwargs)
+            worker_kwargs = kwargs.copy()
+            if seed is not None and self.reproducible:
+                worker_kwargs["seed"] = seed + idx * self.envs_per_worker
+            e.async_reset.remote(**worker_kwargs)
             handles.append(e.recv.remote())
 
         self.async_handles = handles
@@ -788,7 +819,10 @@ class Ray:
         self.ray.shutdown()
 
 
-def make(env_creator_or_creators, env_args=None, env_kwargs=None, backend=PufferEnv, num_envs=1, seed=0, **kwargs):
+def make(
+    env_creator_or_creators, env_args=None, env_kwargs=None, backend=PufferEnv,
+    num_envs=1, seed=0, reproducible=False, **kwargs,
+):
     if num_envs < 1:
         raise pufferlib.APIUsageError("num_envs must be at least 1")
     if num_envs != int(num_envs):
@@ -802,7 +836,11 @@ def make(env_creator_or_creators, env_args=None, env_kwargs=None, backend=Puffer
 
     if backend == PufferEnv:
         env_args = env_args or []
-        env_kwargs = env_kwargs or {}
+        if reproducible:
+            env_kwargs = dict(env_kwargs or {})
+            env_kwargs.setdefault("seed", seed)
+        else:
+            env_kwargs = env_kwargs or {}
         vecenv = env_creator_or_creators(*env_args, **env_kwargs)
         if not isinstance(vecenv, PufferEnv):
             raise pufferlib.APIUsageError(
@@ -880,6 +918,11 @@ def make(env_creator_or_creators, env_args=None, env_kwargs=None, backend=Puffer
 
     # TODO: First step action space check
 
+    if reproducible:
+        kwargs["seed"] = seed
+        kwargs["reproducible"] = True
+        if backend is Multiprocessing:
+            kwargs["sync_traj"] = True
     return backend(env_creators, env_args, env_kwargs, num_envs, **kwargs)
 
 

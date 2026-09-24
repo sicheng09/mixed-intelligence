@@ -19,6 +19,15 @@ from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 
+# `binding.shared` receives its seed through a signed C `int` argument.
+_C_INT_SEED_UPPER_BOUND = np.iinfo(np.int32).max
+
+
+def _sample_reproducible_seed():
+    """Sample a reproducible seed that fits the Drive C binding's `int`."""
+    return int(np.random.randint(0, _C_INT_SEED_UPPER_BOUND))
+
+
 class Drive(pufferlib.PufferEnv):
     # Ordered list of reward components written into `self.reward_components`
     # per-step by the C env. Index order must match the RC_* enum in drive.h.
@@ -72,6 +81,7 @@ class Drive(pufferlib.PufferEnv):
         idm_others=False,
         buf=None,
         seed=1,
+        reproducible=False,
         init_steps=0,
         init_mode="create_all_valid",
         control_mode="control_vehicles",
@@ -196,6 +206,11 @@ class Drive(pufferlib.PufferEnv):
             if buf is not None and "population_mixture" in buf
             else mixture_payload(self.population_descriptor_std))
         self.population_adversary = self._as_bool(population_adversary)
+        self.reproducible = self._as_bool(reproducible)
+        if self.reproducible and not getattr(binding, "SEEDED_SHARED", False):
+            raise RuntimeError(
+                "Drive reproducibility requires rebuilding the C binding with seeded map sampling"
+            )
         self.population_gamma = float(population_gamma)
         self.population_episode_decay = float(population_episode_decay)
         self.population_reward_mode = str(population_reward_mode).strip().lower()
@@ -346,6 +361,9 @@ class Drive(pufferlib.PufferEnv):
             shared_num_agents = max(1, int(num_agents * self.ppo_fraction))
 
         # Iterate through all maps to count total agents that can be initialized for each map
+        shared_kwargs = self._extra_c_kwargs()
+        if self.reproducible:
+            shared_kwargs["seed"] = int(seed)
         agent_offsets, map_ids, num_envs = binding.shared(
             #map_dir=map_dir,
             num_agents=shared_num_agents,
@@ -361,7 +379,7 @@ class Drive(pufferlib.PufferEnv):
             goal_lane_change_prob=self.goal_lane_change_prob,
             use_all_maps=use_all_maps,
             map_id=self.map_id,
-            **self._extra_c_kwargs(),
+            **shared_kwargs,
         )
 
         # agent_offsets[-1] = actual PPO agent count from my_shared.
@@ -785,6 +803,12 @@ class Drive(pufferlib.PufferEnv):
         """Resample environment maps. Closes current envs and creates new ones."""
         self.tick = 0
         binding.vec_close(self.c_envs)
+        seed = None
+        if self.reproducible:
+            seed = _sample_reproducible_seed()
+        shared_kwargs = self._extra_c_kwargs()
+        if seed is not None:
+            shared_kwargs["seed"] = seed
         agent_offsets, map_ids, num_envs = binding.shared(
             num_agents=self.num_agents,
             num_maps=self.num_maps,
@@ -800,14 +824,15 @@ class Drive(pufferlib.PufferEnv):
             data_root=self.data_root,
             use_all_maps=False,
             map_id=self.map_id,
-            **self._extra_c_kwargs(),
+            **shared_kwargs,
         )
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
         self._initialize_population_window()
         env_ids = []
-        seed = np.random.randint(0, 2**32 - 1)
+        if seed is None:
+            seed = int(np.random.randint(0, 2**32 - 1))
         for i in range(num_envs):
             cur = agent_offsets[i]
             nxt = agent_offsets[i + 1]

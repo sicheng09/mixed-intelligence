@@ -15,6 +15,7 @@
 #define MY_SHARED
 #define MY_PUT
 #define MY_GET
+#define SEEDED_SHARED 1
 
 // Forward declarations for snapshot functions
 static PyObject* vec_create_snapshot(PyObject* self, PyObject* args);
@@ -461,8 +462,13 @@ static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
     float goal_lane_change_prob = (float)unpack(kwargs, "goal_lane_change_prob");
     int use_all_maps = unpack(kwargs, "use_all_maps");
     int specific_map_id = unpack(kwargs, "map_id");  // Default: -1
-    clock_gettime(CLOCK_REALTIME, &ts);
-    srand(ts.tv_nsec);
+    if (kwargs && PyDict_GetItemString(kwargs, "seed")) {
+        int seed = (int)unpack(kwargs, "seed");
+        srand((unsigned int)seed);
+    } else {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        srand(ts.tv_nsec);
+    }
     int total_agent_count = 0;
     int env_count = 0;
     int max_envs = (specific_map_id >= 0) ? 1 : (use_all_maps ? num_maps : num_agents);
