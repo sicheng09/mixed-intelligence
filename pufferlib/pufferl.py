@@ -3123,7 +3123,7 @@ def load_env(env_name, args):
     population_env_keys = (
         "population_adversary", "population_gamma", "population_episode_decay",
         "population_epsilon", "population_rho_min", "population_rho_max",
-        "population_std_start",
+        "population_std_start", "population_reward_mode",
     )
     if mode == "legacy" and _as_bool(args.get("train", {}).get("population_adversary", False)):
         for key in population_env_keys:

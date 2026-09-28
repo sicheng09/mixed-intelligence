@@ -255,6 +255,27 @@ def test_population_first_episode_mode_ignores_later_cohorts_without_decay():
     assert env._population_episode_count[0] == 1
 
 
+def test_population_reward_mode_reaches_environment(monkeypatch):
+    from pufferlib.pufferl import load_env
+    import pufferlib.vector
+
+    captured = {}
+    sentinel = object()
+
+    def capture(make_env, *, env_kwargs, **vec_kwargs):
+        captured.update(env_kwargs)
+        return sentinel
+
+    monkeypatch.setattr(pufferlib.vector, "make", capture)
+    args = {
+        "package": "ocean", "env": {}, "vec": {},
+        "train": {"population_adversary": True,
+                  "population_reward_mode": "first_episode"},
+    }
+    assert load_env("puffer_drive", args) is sentinel
+    assert captured["population_reward_mode"] == "first_episode"
+
+
 def _population_test_trainer(chunk_size=64, target_kl=0.03):
     from pufferlib.pufferl import PuffeRL
     trainer = PuffeRL.__new__(PuffeRL)
