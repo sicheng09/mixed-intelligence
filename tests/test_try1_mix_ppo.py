@@ -280,6 +280,8 @@ def _population_test_trainer(chunk_size=64, target_kl=0.03):
     from pufferlib.pufferl import PuffeRL
     trainer = PuffeRL.__new__(PuffeRL)
     trainer.population_adversary = True
+    trainer.population_monitor_dir = None
+    trainer.population_update_count = 0
     trainer.config = dict(device='cpu', population_batch_size=256,
                           population_minibatch_size=chunk_size,
                           population_update_epochs=4, population_target_kl=target_kl)

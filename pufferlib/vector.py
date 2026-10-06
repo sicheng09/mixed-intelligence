@@ -277,6 +277,10 @@ def _worker_process(
     )
     buf["masks"][:] = True
 
+    if reproducible:
+        random.seed(seed)
+        np.random.seed(seed)
+
     if is_native and num_envs == 1:
         envs = env_creators[0](*env_args[0], **env_kwargs[0], buf=buf, seed=seed)
     else:
@@ -457,6 +461,11 @@ class Multiprocessing:
         )
         self.buf["population_mixture"][:] = mixture_payload(
             getattr(driver_env, "population_descriptor_std", .35))
+        # In reproducible mode, publish each descriptor only when its worker
+        # is idle and receives its next command. Writing all rows immediately
+        # races with workers still sampling the previous map window.
+        self._pending_population_policy = None
+        self._pending_population_mixture = None
         self.buf["semaphores"][:] = MAIN
 
         from multiprocessing import Pipe, Process
@@ -598,6 +607,7 @@ class Multiprocessing:
 
         idxs = self.w_slice
         self.actions[idxs] = actions
+        self._publish_population_snapshot(idxs)
         self.buf["semaphores"][idxs] = STEP
 
     def set_policy_values(self, values):
@@ -605,12 +615,33 @@ class Multiprocessing:
         target[:] = np.asarray(values, dtype=np.float32).reshape(target.shape)
 
     def set_population_mixture(self, probabilities, std, version):
+        if self.reproducible:
+            self._pending_population_mixture = (
+                np.asarray(probabilities).copy(), float(std), int(version))
+            return
         for target in self.buf["population_mixture"]:
             publish_mixture(target, probabilities, std, version)
 
     def set_population_policy(self, mean, std):
+        if self.reproducible:
+            self._pending_population_policy = (
+                np.asarray(mean, dtype=np.float32).copy(), float(std))
+            return
         self.buf["population_policy_mean"][:] = np.asarray(mean, dtype=np.float32)
         self.buf["population_policy_std"][:] = float(std)
+
+    def _publish_population_snapshot(self, workers):
+        if not self.reproducible:
+            return
+        if self._pending_population_policy is not None:
+            mean, std = self._pending_population_policy
+            self.buf["population_policy_mean"][workers] = mean
+            self.buf["population_policy_std"][workers] = std
+        if self._pending_population_mixture is not None:
+            probabilities, std, version = self._pending_population_mixture
+            indices = np.arange(self.num_workers)[workers]
+            for worker in np.atleast_1d(indices):
+                publish_mixture(self.buf["population_mixture"][worker], probabilities, std, version)
 
     def async_reset(self, seed=0):
         # Flush any waiting workers
@@ -633,6 +664,7 @@ class Multiprocessing:
         self.waiting_workers = list(range(self.num_workers))
         self.infos = [[] for _ in range(self.num_workers)]
 
+        self._publish_population_snapshot(slice(None))
         self.buf["semaphores"][:] = RESET
         for i in range(self.num_workers):
             start = i * self.envs_per_worker
