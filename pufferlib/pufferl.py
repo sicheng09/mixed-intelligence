@@ -239,6 +239,7 @@ class PuffeRL:
         self.logprobs = torch.zeros(segments, horizon, device=device)
         self.rewards = torch.zeros(segments, horizon+1, device=device)
         self.terminals = torch.zeros(segments, horizon, device=device)
+        self.bootstrap_terminals = torch.zeros(segments, device=device)
         self.truncations = torch.zeros(segments, horizon, device=device)
         self.ratio = torch.ones(segments, horizon, device=device)
         self.importance = torch.ones(segments, horizon, device=device)
@@ -828,6 +829,7 @@ class PuffeRL:
             self._opponent_pool_shadow.load_state_dict(self.opponent_pool_snapshots[snap_idx])
 
         self.full_rows = 0
+        self.bootstrap_terminals.zero_()
         while self.full_rows < self.segments:
             profile("env", epoch)
             o, r, d, t, info, env_id, mask = self.vecenv.recv()
@@ -903,6 +905,7 @@ class PuffeRL:
                     else:
                         self.observations[rows, config["bptt_horizon"]] = o_device[pending_mask]
                     self.rewards[rows, config["bptt_horizon"]] = r[pending_mask]
+                    self.bootstrap_terminals[rows] = d[pending_mask].float()
                     self.values[rows, config["bptt_horizon"]] = value.flatten()[pending_mask]
                     pending_rows[pending_mask] = -1
                     self.bootstrap_indices[env_id] = pending_rows.int()
@@ -986,6 +989,7 @@ class PuffeRL:
                 else:
                     self.observations[pending_rows[pending_mask], config["bptt_horizon"]] = o_device[pending_mask]
                 self.rewards[pending_rows[pending_mask], config["bptt_horizon"]] = r[pending_mask]
+                self.bootstrap_terminals[pending_rows[pending_mask]] = d[pending_mask].float()
 
             with torch.no_grad(), self.amp_context:
                 state = dict(
@@ -1021,6 +1025,17 @@ class PuffeRL:
             #             self.observations[batch_rows, l+1] = o_device
 
         profile("eval_misc", epoch)
+
+        # Measure the old copied-flag approximation without feeding it into training.
+        valid_end = (self.observations[:, -1, 0].to(device) != -1000) & ~self.truncations[:, -1].bool()
+        end_mismatch = (self.bootstrap_terminals != self.terminals[:, -1]) & valid_end
+        self.stats["bootstrap/end_done_mismatch_count"].append(float(end_mismatch.sum()))
+        self.stats["bootstrap/valid_segment_ends"].append(float(valid_end.sum()))
+        self.stats["bootstrap/end_done_mismatch_rate"].append(
+            float(end_mismatch.sum() / valid_end.sum().clamp(min=1)))
+        old_delta_bias = config["gamma"] * self.values[:, -1] * (self.bootstrap_terminals - self.terminals[:, -1])
+        self.stats["bootstrap/mean_abs_old_delta_bias"].append(
+            float((old_delta_bias.abs() * valid_end).sum() / valid_end.sum().clamp(min=1)))
 
         # Record short rollouts on driver_env across multiple scenarios with current policy
         if self._capture_video:
@@ -1135,6 +1150,7 @@ class PuffeRL:
         mb_prio,
         mb_filter_mask,
         policy_uses_rnn=None,
+        mb_bootstrap_terminals=None,
     ):
         config = self.config
         device = config["device"]
@@ -1171,7 +1187,7 @@ class PuffeRL:
             clipfrac = ((ratio - 1.0).abs() > config["clip_coef"]).float().mean()
 
         adv = mb_advantages
-        terminals_extended = torch.cat((mb_terminals, mb_terminals[:, -1:]), dim=1)
+        terminals_extended = extend_terminals(mb_terminals, mb_bootstrap_terminals)
         adv = compute_puff_advantage(
             mb_values,
             mb_rewards,
@@ -1337,7 +1353,7 @@ class PuffeRL:
                 device=device,
             )
             adv_terminal[:, :-1] = self.terminals
-            adv_terminal[:, -1] = self.terminals[:, -1]
+            adv_terminal[:, -1] = self.bootstrap_terminals
             advantages = compute_puff_advantage(
                 self.values,
                 self.rewards,
@@ -1461,6 +1477,7 @@ class PuffeRL:
                             mb_prio,
                             mb_filter_mask,
                             self.policy_uses_rnn[policy_idx],
+                            self.bootstrap_terminals[idx],
                         )
                     )
 
@@ -1598,7 +1615,7 @@ class PuffeRL:
             advantages = torch.zeros(shape, device=device)
             adv_terminal = torch.empty((self.terminals.shape[0], self.terminals.shape[1]+1), device=device)
             adv_terminal[:, :-1] = self.terminals
-            adv_terminal[:, -1] = self.terminals[:, -1]
+            adv_terminal[:, -1] = self.bootstrap_terminals
             advantages = compute_puff_advantage(
                 self.values,
                 self.rewards,
@@ -1725,6 +1742,7 @@ class PuffeRL:
                         mb_prio[policy_mask],
                         policy_filter_mask,
                         self.policy_uses_rnn[policy_idx],
+                        self.bootstrap_terminals[selected_idx],
                     )
 
                     self.ratio[selected_idx] = ratio.detach()
@@ -1778,7 +1796,7 @@ class PuffeRL:
                 clipfrac = ((ratio - 1.0).abs() > config["clip_coef"]).float().mean()
 
             adv = advantages[idx]
-            terminals_extended = torch.cat((mb_terminals, mb_terminals[:, -1:]), dim=1)
+            terminals_extended = extend_terminals(mb_terminals, self.bootstrap_terminals[idx])
             # is this really necessary??
             adv = compute_puff_advantage(
                 mb_values,
@@ -2326,6 +2344,13 @@ class PuffeRL:
             console.print(dashboard)
 
         print("\033[0;0H" + capture.get())
+
+
+def extend_terminals(terminals, bootstrap_terminals):
+    """Append the actual next-observation terminal flag to a rollout segment."""
+    if bootstrap_terminals is None:
+        raise ValueError("Actual segment-end terminal flags are required")
+    return torch.cat((terminals, bootstrap_terminals.reshape(-1, 1)), dim=1)
 
 
 def compute_puff_advantage(

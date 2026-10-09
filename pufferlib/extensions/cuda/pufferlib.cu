@@ -21,6 +21,7 @@ __host__ __device__ void puff_advantage_row_cuda(float* values, float* rewards, 
         int t_next = t + 1;
         if (truncations[t] == 1.0){
             advantages[t] = 0.0;
+            lastpufferlam = 0.0; // Match the CPU kernel at reset boundaries.
         } else {
         float nextnonterminal = 1.0 - terminations[t_next];
         float rho_t = fminf(importance[t], rho_clip);
