@@ -31,6 +31,7 @@ from torch.utils.cpp_extension import (
 DEBUG = os.getenv("DEBUG", "0") == "1"
 NO_OCEAN = os.getenv("NO_OCEAN", "0") == "1"
 NO_TRAIN = os.getenv("NO_TRAIN", "0") == "1"
+DRIVE_ONLY = os.getenv("PUFFER_DRIVE_ONLY", "0") == "1"
 
 # Build raylib for your platform
 RAYLIB_URL = "https://github.com/raysan5/raylib/releases/download/5.5/"
@@ -92,7 +93,8 @@ def download_library(url: str, name: str, tag: str, ext: str = "tar.gz", files_t
 
 if not NO_OCEAN:
     download_library(INIH_URL, "inih", "r62", files_to_extract=["ini.c", "ini.h"])
-    download_raylib("raylib-5.5_webassembly", ".zip")
+    if not DRIVE_ONLY:
+        download_raylib("raylib-5.5_webassembly", ".zip")
 
 BOX2D_URL = "https://github.com/capnspacehook/box2d/releases/latest/download/"
 BOX2D_NAME = "box2d-macos-arm64" if platform.system() == "Darwin" else "box2d-linux-amd64"
@@ -113,7 +115,7 @@ def download_box2d(platform):
         os.remove(platform + ext)
 
 
-if not NO_OCEAN:
+if not NO_OCEAN and not DRIVE_ONLY:
     download_box2d("box2d-web")
 
 # Shared compile args for all platforms
@@ -194,7 +196,7 @@ elif system == "Darwin":
 else:
     raise ValueError(f"Unsupported system: {system}")
 
-if not NO_OCEAN:
+if not NO_OCEAN and not DRIVE_ONLY:
     download_box2d(BOX2D_NAME)
 
 # Default Gym/Gymnasium/PettingZoo versions
@@ -248,6 +250,8 @@ extension_kwargs = dict(
 c_extensions = []
 if not NO_OCEAN:
     c_extension_paths = glob.glob("pufferlib/ocean/**/binding.c", recursive=True)
+    if DRIVE_ONLY:
+        c_extension_paths = [p for p in c_extension_paths if p == "pufferlib/ocean/drive/binding.c"]
     c_extensions = [
         Extension(
             path.rstrip(".c").replace("/", "."),
@@ -321,13 +325,9 @@ install_requires = [
     "gym==0.23",
     "gymnasium==0.29.1",
     "pettingzoo==1.24.1",
-    "tensorflow==2.20.0",
-    "waymo-open-dataset-tf-2-11-0==1.6.1",
-    "scipy==1.17.0",
-    "pillow==11.3.0",
-    "msgpack==1.1.2",
-    "torch-geometric==2.7.0",
-    "torch-cluster==1.6.3",
+    "scipy>=1.10,<2",
+    "pillow>=9.2",
+    "msgpack>=1.0",
 ]
 
 if not NO_TRAIN:
@@ -351,6 +351,12 @@ setup(
     package_data={"pufferlib": [RAYLIB_NAME + "/lib/libraylib.a"]},
     include_package_data=True,
     install_requires=install_requires,
+    # Waymo 1.6.1 requires TF 2.11 / NumPy 1.21.5 and belongs in a
+    # separate Python 3.10 environment, not the modern PyTorch trainer.
+    extras_require={
+        "waymo": ["waymo-open-dataset-tf-2-11-0==1.6.1"],
+        "prediction": ["torch-geometric==2.7.0", "torch-cluster==1.6.3"],
+    },
     ext_modules=c_extensions + torch_extensions,
     cmdclass={
         "build_ext": BuildExt,

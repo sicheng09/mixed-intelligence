@@ -66,7 +66,7 @@ def _enrich_worker(args):
         return (False, str(e))
 
 
-def extract_connectivity_parallel(tfrecord_dir, num_workers=80):
+def extract_connectivity_parallel(tfrecord_dir, num_workers=80, tf_python=None):
     """Process all TFRecords in parallel via subprocesses."""
     tfrecord_dir = Path(tfrecord_dir)
     tfrecord_files = sorted(f for f in tfrecord_dir.iterdir() if 'tfrecord' in f.name)
@@ -124,7 +124,7 @@ print(f"Done: {len(tf_paths)} tfrecords -> {len(result)} scenarios")
         out_file = tempfile.mktemp(suffix=f'_b{i}.pkl')
         output_files.append(out_file)
         p = subprocess.Popen(
-            [sys.executable, str(helper_script), json.dumps(batch), out_file],
+            [tf_python or sys.executable, str(helper_script), json.dumps(batch), out_file],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         processes.append(p)
@@ -175,7 +175,7 @@ print(f"Done: {len(tf_paths)} tfrecords -> {len(result)} scenarios")
     return connectivity_map
 
 
-def process_split(split, tfrecord_root, json_root, enriched_root, output_root, workers):
+def process_split(split, tfrecord_root, json_root, enriched_root, output_root, workers, tf_python=None):
     """Process one split end-to-end."""
     tfrecord_dir = Path(tfrecord_root) / split
     json_dir = Path(json_root) / split
@@ -200,7 +200,7 @@ def process_split(split, tfrecord_root, json_root, enriched_root, output_root, w
 
     # Step 1: Extract connectivity
     print(f"\n[{split}] Step 1: Extract lane connectivity from TFRecords")
-    connectivity_map = extract_connectivity_parallel(tfrecord_dir, num_workers=workers)
+    connectivity_map = extract_connectivity_parallel(tfrecord_dir, num_workers=workers, tf_python=tf_python)
 
     # Step 2: Enrich JSONs
     print(f"\n[{split}] Step 2: Enrich {len(json_files)} JSONs with connectivity")
@@ -239,6 +239,9 @@ def main():
     parser.add_argument("--enriched-root", required=True, help="Output root for enriched JSONs")
     parser.add_argument("--output-root", required=True, help="Output root for binary .bin files")
     parser.add_argument("--workers", type=int, default=80, help="Number of parallel workers")
+    parser.add_argument("--tf-python", default=None,
+                        help="Python executable in the separate TensorFlow/Waymo environment; "
+                             "the current interpreter still performs simulator binary conversion")
     parser.add_argument("--splits", type=str, default="training,validation,testing",
                         help="Comma-separated splits to process")
     args = parser.parse_args()
@@ -254,7 +257,7 @@ def main():
 
     for split in splits:
         process_split(split, args.tfrecord_root, args.json_root,
-                       args.enriched_root, args.output_root, args.workers)
+                       args.enriched_root, args.output_root, args.workers, args.tf_python)
 
     # Final summary
     print(f"\n{'='*60}")

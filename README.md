@@ -1,466 +1,232 @@
-# BehaviorBench
+# APEX: Robust Driving Self-Play through Adaptive Population Exploration
 
-This is the companion code for the benchmarking study reported in the paper "Beyond Self-Play and Scale: A Behavior Benchmark for Generalization in Autonomous Driving", submitted to NeurIPS2026. The paper can be found here http://arxiv.org/abs/xxxx.xxxx. The code allows the users to reproduce and extend the results reported in the study. Please cite the above paper when reporting, reproducing or extending the results.
+**APEX** learns a robust focal driving policy by adapting the behavior distribution
+of a separately trained traffic population. This repository builds on
+[BehaviorBench](https://github.com/boschresearch/behavior-bench) and
+[PufferDrive](https://github.com/Emerge-Lab/PufferDrive).
 
-This software is a research prototype, solely developed for and published as part of the publication above.
+[![APEX overview: conventional self-play, adaptive behavior populations, and closed-loop policy and population updates](docs/assets/introduction.jpg)](docs/assets/introduction.jpg)
 
-The companion code is a fork of [PufferDrive](https://github.com/Emerge-Lab/PufferDrive/). Below are instructions in setting up PufferDrive as well as the BehaviorBench additions.
+*Overview of APEX. A focal policy and a behavior-conditioned traffic policy learn
+through interaction, while a population constructor adapts which self-interested
+traffic behaviors are encountered. Click the figure to view the full-size image.*
 
-# PufferDrive
+## Method
 
-<img align="left" style="width:260px" src="https://github.com/Emerge-Lab/PufferDrive/blob/main/pufferlib/resources/drive/pufferdrive_20fps_long.gif" width="288px">
+APEX addresses homogeneous self-play interactions and fixed training-time behavior
+mixtures through:
 
-**PufferDrive is a fast and friendly driving simulator to train and test RL-based models.**
+- **Separate focal and traffic policies**, trained with policy-specific PPO updates
+  and a nominal 50:50 agent allocation.
+- **Behavior-conditioned traffic**, with four reward coordinates and two perception
+  conditions controlling radius and field of view.
+- **Adaptive population exploration**, using a learnable Gaussian descriptor to
+  parameterize six Beta-distributed conditions, with critic-centered feedback.
 
-<br>
-<br>
-<br>
-<br>
-<br>
-<br>
-<br>
-<br>
-<br>
-<br>
+The focal policy is evaluated independently: the population constructor and
+traffic-condition selection are not needed to deploy it.
 
----
+## Results
 
-**Docs**: https://emerge-lab.github.io/PufferDrive
+Results below are reported in **Table 1 of the APEX manuscript**, using the
+[BehaviorBench](https://github.com/boschresearch/behavior-bench) evaluation protocol.
+Each entry is the mean aggregate score over the complete **1,000-scene** split,
+multiplied by 100; **higher is better**. Each planner uses one fixed checkpoint
+across all eight traffic populations, with traffic-controller checkpoints shared
+across planners. Bold indicates the best score in each column.
 
----
+### Interactive1k
 
-### See our 2.0 release video
+| Planner | IDM | PPO | SMART | Expert | Aggr. | Normal | Caut. | Mix |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| IDM | 15.05 | 16.91 | 15.70 | 12.13 | 19.21 | 16.29 | 12.53 | 15.39 |
+| PDM | 23.99 | 23.01 | 30.43 | 20.60 | 33.66 | 28.66 | 19.36 | 27.03 |
+| SMART | 22.53 | 29.11 | 30.94 | 28.04 | 32.86 | 30.16 | 22.28 | 27.83 |
+| PPO | 38.73 | 51.54 | 41.69 | 29.40 | 49.17 | 43.32 | 39.15 | 43.44 |
+| **APEX (Ours)** | **41.45** | **52.34** | **45.22** | **32.33** | **51.53** | **47.04** | **41.85** | **46.33** |
 
-<a href="https://www.youtube.com/watch?v=LfQ324R-cbE">
-  <img src="https://img.youtube.com/vi/LfQ324R-cbE/0.jpg" alt="PufferDrive 2.0" width="300">
-</a>
+APEX achieves the highest score under all eight traffic populations on this
+interaction-heavy split. The mean across populations increases from **42.06** for
+PPO to **44.76** for APEX.
+
+Aggr., Caut., and Mix denote aggressive, cautious, and mixed conditioned traffic.
+See [EVALUATION.md](EVALUATION.md) for the evaluation commands and traffic settings.
 
 ## Installation
 
-Clone the repo
-```bash
-https://github.com/Emerge-Lab/PufferDrive.git
-```
+Use two isolated environments to separate the modern PyTorch simulator/trainer
+from the legacy TensorFlow/Waymo preprocessing stack:
 
-Make a venv (`uv venv`), activate the venv
-```
-source .venv/bin/activate
-```
-
-Inside the venv, install the dependencies
-```
-uv pip install -e .
-```
-
-Compile the C code
-```
-python setup.py build_ext --inplace --force
-```
-Run this while your virtual environment is active so the extension is built against the right interpreter.
-
-To test your setup, you can run
-```
-puffer train puffer_drive
-```
-See also the [puffer docs](https://puffer.ai/docs.html).
-
-
-## Quick start
-
-Start a training run
-```
-puffer train puffer_drive
-```
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [EVALUATION.md](EVALUATION.md) | Planner evaluation framework (eval.py) - ego planners vs traffic controllers |
-| [REALISM_EVALUATION.md](REALISM_EVALUATION.md) | WOSAC realism evaluation (eval_realism.py) - distributional realism metrics |
-| [BENCHMARK.md](BENCHMARK.md) | Interactive benchmark extraction from Waymo data |
-| [TRAINING.md](TRAINING.md) | PufferRL PPO training configuration and usage |
-| [PREDICTION.md](PREDICTION.md) | SMART prediction model - architecture, training, evaluation |
-| [NUPLAN.md](NUPLAN.md) | nuPlan integration - evaluate PufferDrive planners on nuPlan |
-
----
-
-## Planner Evaluation
-
-PufferDrive includes a config-driven evaluation framework for testing different planning algorithms as ego planners and traffic controllers. See [EVALUATION.md](EVALUATION.md) for comprehensive documentation.
-
-### Pre-trained Weights
-
-The repository includes pre-trained weights in `weights/`:
-
-| File | Description |
-|------|-------------|
-| `weights/simple_ppo.pt` | PPO policy trained with self-play and simple reward on WOMD |
-| `weights/conditioned_ppo.pt` | Conditioned PPO policy trained with self-play on WOMD |
-| `weights/smart_epoch_030.pt` | SMART prediction model (1M params, 30 epochs) |
-
-### Benchmark Splits
-
-We provide two curated evaluation splits:
-
-| Split | Name | Description |
-|-------|------|-------------|
-| `interactive1k` | **Interactive1k** | 1,000 most interactive WOMD validation scenarios |
-| `random1k` | **Random1k** | 1,000 random WOMD validation scenarios |
-
-See [BENCHMARK.md](BENCHMARK.md) for data preprocessing, download instructions and benchmark details.
-
-### Available Planners
-
-| Planner | Description |
-|---------|-------------|
-| `pdm` | Predictive Driver Model. Proposes trajectory candidates via IDM with different velocities/offsets, selects best. |
-| `ppo` | Pre-trained RL policy with LSTM. Requires checkpoint weights. |
-| `smart` | SMART autoregressive trajectory prediction. Requires trained weights. |
-| `idm` | Intelligent Driver Model. Rule-based lane-following. |
-| `hybrid` | PPO + PDM |
-| `conditioned_aggr` / `conditioned_normal` / `conditioned_caut` | Reward-conditioned PPO variants. |
-| `constant_velocity` | Baseline that maintains current velocity. |
-
-### Available Traffic Agents
-
-| Traffic Agent | Description |
-|---------------|-------------|
-| `idm` | Intelligent Driver Model. Default traffic controller, rule-based lane-following. |
-| `pdm` | Predictive Driver Model used as traffic. |
-| `ppo` | Pre-trained RL policy used for traffic agents. Requires checkpoint weights. |
-| `smart` | SMART autoregressive trajectory prediction for traffic. Requires trained weights. |
-| `conditioned_mix` / `conditioned_aggr` / `conditioned_normal` / `conditioned_caut` | Reward-conditioned PPO traffic variants. |
-| `expert` | Ground truth trajectory replay from the Waymo dataset (traffic only). |
-| `constant_velocity` | Baseline that maintains current velocity. |
-
-### Quick Start
+| Environment | Main dependencies | Purpose |
+|---|---|---|
+| `apex-train` | Python 3.11, PyTorch 2.5.1 / CUDA 11.8, PyG 2.7 | Training, binary conversion, evaluation |
+| `apex-data` | Python 3.10, TensorFlow 2.11, Waymo SDK 1.6.1 | Raw WOMD preprocessing |
 
 ```bash
-export DRIVE_BINARIES_DATA_ROOT=/path/to/binaries
-
-# PDM ego vs IDM traffic (default)
-python pufferlib/ocean/benchmark/eval.py --map-ids 0-10
-
-# SMART ego planner (using provided weights)
-python pufferlib/ocean/benchmark/eval.py --planner.type smart \
-    --planner.smart.weights-path weights/smart_1M_epoch_029.pt --map-ids 0-10
-
-# PPO ego vs SMART traffic (using provided weights)
-python pufferlib/ocean/benchmark/eval.py --planner.type ppo \
-    --planner.ppo.weights-path weights/ppo_self_play.pt \
-    --traffic.type smart --traffic.smart.weights-path weights/smart_1M_epoch_029.pt
-
-# Enable visualization
-python pufferlib/ocean/benchmark/eval.py --eval.viz True --map-ids 5
+git clone https://github.com/sicheng09/mixed-intelligence.git
+cd mixed-intelligence
+bash scripts/setup_apex.sh
+source scripts/apex_env.sh train
 ```
 
----
+The installer builds the Drive C extension and the C/CUDA advantage kernel.
+The training build requires a C/C++ compiler and the CUDA 11.8 toolkit. PyTorch
+automatically selects CUDA architectures from the GPUs visible during the build.
+When building without a visible GPU or for different target GPUs, set
+`TORCH_CUDA_ARCH_LIST` explicitly. Environments, caches, data, and run outputs stay
+under `APEX_WORKSPACE`, which defaults to the parent directory of the repository.
+See [setup notes](docs/APEX_SETUP.md) for dependency specifications and
+environment switching.
 
-## RL Training with PufferRL
+## Training data
 
-PufferDrive uses [PufferLib](https://puffer.ai/) for RL training with PPO (Proximal Policy Optimization). Training is configured via INI config files and command-line overrides.
-
-### Basic Training
+We use the official **10,000-scene medium training subset** of WOMD distributed in
+[`EMERGE-lab/GPUDrive`](https://huggingface.co/datasets/EMERGE-lab/GPUDrive).
+The preparation script selects `training/group_0` at a fixed dataset revision,
+downloads the scenarios, and converts them into PufferDrive binary maps:
 
 ```bash
-# Start training with default config
-puffer train puffer_drive
-
-# Train with custom parameters
-puffer train puffer_drive --train.learning-rate 0.001 --train.batch-size 262144
-
-# Resume from checkpoint
-puffer train puffer_drive --load-model-path experiments/puffer_drive/checkpoints/model_001000.pt
-
-# Evaluate a trained model
-puffer eval puffer_drive --load-model-path experiments/puffer_drive/checkpoints/model_001000.pt
+source scripts/apex_env.sh train
+python scripts/prepare_apex_medium.py --download --convert --workers 4
 ```
 
-### Training Workflow
+The script resumes interrupted downloads, verifies all 10,000 scenarios, and
+records the source revision and map-to-JSON correspondence. Existing outputs are
+checked before reuse. The resulting layout is:
 
-1. **Environment Creation**: Multiple vectorized Drive environments are created across `num_workers` processes, each managing `num_envs` environments
-2. **Experience Collection**: The policy collects rollouts of length `bptt_horizon` across all environments simultaneously, filling a batch of size `batch_size`
-3. **Policy Update**: The batch is split into `minibatch_size` chunks and PPO gradient updates are applied
-4. **Repeat**: Steps 2-3 repeat until `total_timesteps` is reached
-5. **Checkpointing**: Model weights are saved every `checkpoint_interval` updates to `experiments/puffer_drive/checkpoints/`
+```text
+$APEX_WORKSPACE/datasets/
+  gpudrive-medium/training/group_0/    # 10,000 source JSON scenarios
+  drive-binaries/training/            # map_000000.bin ... map_009999.bin
+```
 
-### Configuration Files
+Activation sets `DRIVE_BINARIES_DATA_ROOT` to `datasets/drive-binaries`.
+Training JSONs retain the lane information supplied by the source dataset.
 
-The training configuration is defined in two INI files:
-- **`pufferlib/config/default.ini`**: Base defaults for all environments
-- **`pufferlib/config/ocean/drive.ini`**: Drive-specific overrides
+## Validation data
 
-Any parameter can be overridden via command-line: `--section.parameter value`
+We follow the original [BehaviorBench benchmark preparation](https://github.com/boschresearch/behavior-bench/blob/main-behavior-bench/BENCHMARK.md)
+for **Interactive1k** and **Random1k**. These are independent, held-out WOMD
+validation splits, each containing 1,000 scenarios.
 
-### Environment Parameters (`[env]`)
+1. Obtain the complete WOMD validation TFRecords and corresponding GPUDrive-style
+   JSON scenarios, following the upstream Waymo/ScenarioMax instructions.
+2. Extract lane connectivity and generate validation binaries.
+3. Apply the checked-in `interactive1k.csv` and `random1k.csv` manifests with
+   `scripts/remap_files.py`.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num_agents` | 1024 | Total agents managed per environment instance (across all loaded maps) |
-| `action_type` | `continuous` | Action space type: `discrete` (7x13=91 actions) or `continuous` |
-| `dynamics_model` | `classic` | Vehicle dynamics: `classic` (acceleration + steering) or `jerk` (jerk-based, 4x3=12 actions) |
-| `dt` | 0.1 | Simulation timestep in seconds (10 Hz, matching WOMD) |
-| `episode_length` | 91 | Steps per episode (91 steps = 9.1 seconds, full WOMD scenario) |
-| `num_maps` | 80000 | Number of map binaries to load |
-| `split` | `training` | Dataset split: `training`, `validation`, `testing`, or custom path |
-| `init_steps` | 0 | Initial trajectory steps to skip (0 = start from beginning) |
-| `control_mode` | `control_vehicles` | Which agents to control: `control_vehicles`, `control_agents`, `control_wosac`, `control_sdc_only` |
-| `init_mode` | `create_all_valid` | Agent creation: `create_all_valid` (all agents) or `create_only_controlled` |
-| `resample_frequency` | 910 | How often to resample new scenarios (in steps) |
-| `termination_mode` | 1 | 0 = terminate at `episode_length`, 1 = terminate after all agents are done |
+The medium training subset and GPUDrive's smaller validation subset do not replace
+these benchmark inputs. See [BENCHMARK.md](BENCHMARK.md) for the preprocessing and
+split-generation commands. The final directories are
+`drive-binaries/interactive1k` and `drive-binaries/random1k`.
 
-**Reward Parameters:**
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `reward_vehicle_collision` | -0.5 | Penalty for colliding with another vehicle |
-| `reward_offroad_collision` | -0.5 | Penalty for going off-road |
-| `reward_goal` | 1.0 | Reward for reaching the goal |
-| `reward_goal_post_respawn` | 0.25 | Reward for reaching goals after first respawn |
+## Training
 
-**Goal Behavior:**
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `goal_behavior` | 3 | What happens when an agent reaches its goal: 0=respawn at start, 1=generate new goal, 2=stop, 3=remove agent |
-| `goal_radius` | 2.0 | Distance threshold (meters) to consider goal reached |
-| `goal_speed` | 100.0 | Maximum target speed towards goal (m/s) |
-| `goal_target_distance` | 30.0 | Distance for newly generated goals (when `goal_behavior=1`) |
-
-**Collision/Offroad Handling:**
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `collision_behavior` | 2 | On collision: 0=ignore, 1=stop agent, 2=remove agent |
-| `offroad_behavior` | 2 | On offroad: 0=ignore, 1=stop agent, 2=remove agent |
-
-### PPO Training Parameters (`[train]`)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `total_timesteps` | 2,000,000,000 | Total training steps (2 billion) |
-| `learning_rate` | 0.003 | Initial learning rate |
-| `anneal_lr` | True | Linearly anneal learning rate to 0 |
-| `batch_size` | 524288 | Total samples per training epoch (= `num_agents * num_workers * bptt_horizon`) |
-| `minibatch_size` | 32768 | Mini-batch size for gradient updates |
-| `bptt_horizon` | 32 | Backpropagation-through-time horizon (sequence length per update) |
-| `gamma` | 0.98 | Discount factor |
-| `gae_lambda` | 0.95 | GAE smoothing parameter |
-| `clip_coef` | 0.2 | PPO clipping coefficient |
-| `vf_coef` | 2.0 | Value function loss weight |
-| `vf_clip_coef` | 0.2 | Value function clipping coefficient |
-| `ent_coef` | 0.005 | Entropy bonus coefficient (encourages exploration) |
-| `max_grad_norm` | 1.0 | Gradient clipping norm |
-| `update_epochs` | 1 | Number of PPO epochs per batch |
-| `checkpoint_interval` | 1000 | Save model every N updates |
-
-**Optimizer Parameters:**
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `optimizer` | `muon` | Optimizer: `adam` or `muon` |
-| `adam_beta1` | 0.9 | Adam beta1 (momentum) |
-| `adam_beta2` | 0.999 | Adam beta2 (RMSProp-like) |
-| `adam_eps` | 1e-8 | Adam epsilon for numerical stability |
-
-**Advanced Parameters:**
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `prio_alpha` | 0.85 | Priority experience sampling alpha |
-| `prio_beta0` | 0.85 | Priority experience sampling beta |
-| `vtrace_rho_clip` | 1.0 | V-trace rho clipping (importance sampling) |
-| `vtrace_c_clip` | 1.0 | V-trace c clipping |
-
-### Vectorization Parameters (`[vec]`)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num_workers` | 16 | Number of parallel worker processes |
-| `num_envs` | 16 | Number of environments per worker |
-| `batch_size` | 4 | Environments per batch in vectorized stepping |
-
-### Policy Architecture (`[policy]`)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `input_size` | 64 | First hidden layer size |
-| `hidden_size` | 256 | Main hidden layer size |
-
-### Observation Space
-
-The observation is a flat vector with three components:
-
-1. **Ego features** (7 for classic, 10 for jerk dynamics):
-   - Position relative to goal, speed, heading, steering, acceleration
-
-2. **Partner features** (7 per agent, max 31 agents = 217):
-   - Relative position, speed, heading, distance to each nearby agent
-
-3. **Road features** (7 per segment, max 128 segments = 896):
-   - Relative position, orientation, type for nearest road segments
-
-Total observation size: 7 + 217 + 896 = **1120** (classic dynamics)
-
-### Hyperparameter Sweeps
+The manuscript-oriented configuration is
+[`drive_apex_medium.ini`](pufferlib/config/ocean/drive_apex_medium.ini): two recurrent
+drivers, seed 42, four billion total agent steps, 910-step population windows,
+continuous perception radius in [20, 50] m, and view caps of 90/180/270/360 degrees.
+The default uses **first-exposure feedback**: for each newly sampled population
+descriptor, the constructor compares the focal critic's initial value estimate
+with the focal agents' first-episode discounted returns. Later episodes continue
+to train the driving policies.
 
 ```bash
-# Run a sweep over learning rate, entropy, and gamma
-puffer sweep puffer_drive
+source scripts/apex_env.sh train
+CUDA_VISIBLE_DEVICES=0 puffer train puffer_drive \
+  --config pufferlib/config/ocean/drive_apex_medium.ini \
+  --train.data-dir "$APEX_WORKSPACE/runs/apex_seed42"
 ```
 
-Sweep ranges are defined in `drive.ini` under `[sweep.*]` sections.
+Select a GPU allocated to your job. Focal and traffic policy checkpoints are saved
+separately.
 
-### Evaluation Modes
+For richer feedback from repeated interactions, an optional **multi-exposure
+feedback extension** accumulates per-episode critic-centered signals over the same
+population window, with a temporal decay that emphasizes earlier episodes. Add
+these options to the training command to enable it:
+
+```text
+--train.population-reward-mode legacy_window --train.population-episode-decay 0.8
+```
+
+This extension uses a window-level objective; the manuscript's first-exposure
+centering analysis applies to the default `first_episode` mode. See
+[setup notes](docs/APEX_SETUP.md) for the two feedback modes and
+[TRAINING.md](TRAINING.md) for PPO training. Additional population experiments and
+historical configurations remain under `scripts/population/`.
+
+## Evaluation
+
+After preparing the benchmark splits, evaluate the supplied focal checkpoint:
 
 ```bash
-# Standard evaluation
-puffer eval puffer_drive --load-model-path model.pt
-
-# WOSAC realism evaluation (distributional metrics)
-puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path model.pt
-
-# Human replay evaluation (SDC only, others follow logs)
-puffer eval puffer_drive --eval.human-replay-eval True --load-model-path model.pt
+source scripts/apex_env.sh train
+CUDA_VISIBLE_DEVICES=0 python pufferlib/ocean/benchmark/eval.py \
+  --eval.split interactive1k --map-ids all \
+  --planner.type ppo \
+  --planner.ppo.weights-path weights/apex_focal_seed42_4b.pt \
+  --traffic.type idm
 ```
 
----
+Switch to `--eval.split random1k` for the other split. Follow
+[EVALUATION.md](EVALUATION.md) for the remaining traffic populations and keep the
+traffic-controller checkpoints fixed across focal-policy comparisons.
 
-## Dataset
+| Checkpoint | Role |
+|---|---|
+| `apex_focal_seed42_4b.pt` | APEX focal policy, view-cap / multi-exposure variant |
+| `conditioned_ppo.pt` | Upstream reward-conditioned traffic policy |
 
-<details>
-<summary>Downloading and using data</summary>
+The listed checkpoints are under `weights/`. The supplied APEX checkpoint and
+manuscript results above use the optional multi-exposure feedback variant; the
+default configuration for new training runs uses first-exposure feedback. PPO
+self-play and SMART pretrained weights can be obtained from the upstream projects
+when needed for baseline or traffic-controller evaluation.
 
-### Downloading Waymo Data
+## Further documentation
 
-You can download the WOMD data from Hugging Face in two versions:
+- [Environment setup](docs/APEX_SETUP.md)
+- [Validation benchmark preparation](BENCHMARK.md)
+- [PPO training](TRAINING.md)
+- [Planner evaluation](EVALUATION.md)
+- [SMART prediction](PREDICTION.md)
 
-- **Mini dataset**: [GPUDrive_mini](https://huggingface.co/datasets/EMERGE-lab/GPUDrive_mini) contains 1,000 training files and 300 test/validation files
-- **Medium dataset**: [10,000 files from the training dataset](https://huggingface.co/datasets/daphne-cornelisse/pufferdrive_train)
-- **Large dataset**: [GPUDrive](https://huggingface.co/datasets/EMERGE-lab/GPUDrive) contains 100,000 unique scenes
+## Attribution, citation, and license
 
-**Note**: Replace 'GPUDrive_mini' with 'GPUDrive' in your download commands if you want to use the full dataset.
+BehaviorBench provides the inherited evaluation infrastructure, traffic baselines,
+and benchmark definitions; PufferDrive/PufferLib provide the simulator and PPO
+foundation. Original copyright notices are retained. The existing
+[AGPL-3.0 license](LICENSE) applies; PufferDrive also contains MIT-licensed upstream
+contributions. Dataset use remains subject to the providers' terms.
 
-### Additional Data Sources
+Please cite the APEX manuscript when using its method, together with the upstream work:
 
-For more training data compatible with PufferDrive, see [ScenarioMax](https://github.com/valeoai/ScenarioMax). The GPUDrive data format is fully compatible with PufferDrive.
-</details>
-
-
-## Visualizer
-
-<details>
-<summary>Dependencies and usage</summary>
-
-## Local rendering
-
-To launch an interactive renderer, first build:
-```
-bash scripts/build_ocean.sh drive local
-```
-
-then launch:
-```bash
-./drive
-```
-this will run `demo()` with an existing model checkpoint.
-
-## Headless server setup
-
-Run the Raylib visualizer on a headless server and export as .mp4. This will rollout the pre-trained policy in the env.
-
-### Install dependencies
-
-```bash
-sudo apt update
-sudo apt install ffmpeg xvfb
-```
-
-For HPC (There are no root privileges), so install into the conda environment
-```bash
-conda install -c conda-forge xorg-x11-server-xvfb-cos6-x86_64
-conda install -c conda-forge ffmpeg
-```
-
-- `ffmpeg`: Video processing and conversion
-- `xvfb`: Virtual display for headless environments
-
-### Build and run
-
-1. Build the application:
-```bash
-bash scripts/build_ocean.sh visualize local
-```
-
-2. Run with virtual display:
-```bash
-xvfb-run -s "-screen 0 1280x720x24" ./visualize
-```
-
-The `-s` flag sets up a virtual screen at 1280x720 resolution with 24-bit color depth.
-
----
-
-> To force a rebuild, you can delete the cached compiled executable binary using `rm ./visualize`.
-
----
-
-</details>
-
-
-## Benchmarks
-
-### Distributional realism
-
-We provide a PufferDrive implementation of the [Waymo Open Sim Agents Challenge (WOSAC)](https://waymo.com/open/challenges/2025/sim-agents/) for fast, easy evaluation of how well your trained agent matches distributional properties of human behavior. See documentation [here](https://emerge-lab.github.io/PufferDrive/wosac/).
-
-WOSAC evaluation with random policy:
-```bash
-puffer eval puffer_drive --eval.wosac-realism-eval True
-```
-
-WOSAC evaluation with your checkpoint (must be .pt file):
-```bash
-puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path <your-trained-policy>.pt
-```
-
-### Human-compatibility
-
-You may be interested in how compatible your agent is with human partners. For this purpose, we support an eval where your policy only controls the self-driving car (SDC). The rest of the agents in the scene are stepped using the logs. While it is not a perfect eval since the human partners here are static, it will still give you a sense of how closely aligned your agent's behavior is to how people drive. You can run it like this:
-```bash
-puffer eval puffer_drive --eval.human-replay-eval True --load-model-path <your-trained-policy>.pt
-```
-
-## Development
-
-<details><summary>Documentation and browser demo</summary>
-
-**Docs**
-
-A browsable documentation site now lives under `docs/` and is configured with mkbooks. To preview locally:
-```
-brew install mdbook
-mdbook serve --open docs
-```
-Open the served URL to see a local version of the docs.
-
-**Interactive demo**
-
-To edit the browser demo, follow these steps:
-- Download [emscripten](https://github.com/emscripten-core/emscripten)
-- emscripten install latest
-- Activate: `source emsdk/emsdk_env.sh`
-- Run `bash scripts/build_ocean.sh drive web`
-- This generates a number of `game*` files, move them to `assets/` to include them on the webpage
-
-</details>
-
-
-## Citation
-
-If you use PufferDrive in your research, please cite:
 ```bibtex
+@article{distelzweig2026behaviorbench,
+  title={Beyond Self-Play and Scale: A Behavior Benchmark for Generalization in Autonomous Driving},
+  author={Distelzweig, Aron and Janjo\v{s}, Faris and Look, Andreas and
+          Rothenh\"{a}usler, Anna and Jost, Daniel and Scheel, Oliver and
+          Rajan, Raghu and Cornelisse, Daphne and Vinitsky, Eugene and Boedecker, Joschka},
+  journal={arXiv preprint arXiv:2605.10034},
+  year={2026},
+  url={https://arxiv.org/abs/2605.10034}
+}
+
 @software{pufferdrive2025github,
-  author = {Daphne Cornelisse* and Spencer Cheng* and Pragnay Mandavilli and Julian Hunt and Kevin Joseph and Waël Doulazmi and Aditya Gupta and Eugene Vinitsky},
-  title = {{PufferDrive}: A Fast and Friendly Driving Simulator for Training and Evaluating {RL} Agents},
-  url = {https://github.com/Emerge-Lab/PufferDrive},
-  version = {2.0.0},
-  year = {2025},
+  author={Cornelisse, Daphne and Cheng, Spencer and Mandavilli, Pragnay and
+          Hunt, Julian and Joseph, Kevin and Doulazmi, Wa\"{e}l and
+          Charraut, Valentin and Gupta, Aditya and Suarez, Joseph and Vinitsky, Eugene},
+  title={PufferDrive: A Fast and Friendly Driving Simulator for Training and Evaluating RL Agents},
+  url={https://github.com/Emerge-Lab/PufferDrive},
+  version={2.0.0},
+  year={2025}
+}
+
+@inproceedings{ettinger2021waymo,
+  title={Large Scale Interactive Motion Forecasting for Autonomous Driving: The Waymo Open Motion Dataset},
+  author={Ettinger, Scott and others},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  year={2021}
 }
 ```

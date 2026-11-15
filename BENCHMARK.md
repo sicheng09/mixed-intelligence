@@ -1,118 +1,96 @@
-# PufferDrive Benchmark Splits
+# BehaviorBench validation splits
 
-This document describes how to reproduce the **Interactive1k** (`pufferinter`) and **Random1k** (`pufferrandom`) benchmark splits from the Waymo Open Motion Dataset (WOMD).
+Validation preparation follows the original
+[BehaviorBench benchmark guide](https://github.com/boschresearch/behavior-bench/blob/main-behavior-bench/BENCHMARK.md).
+The benchmark definitions and split manifests are inherited from that project.
 
-The two splits are defined by CSV manifests checked into the repo at:
+**Interactive1k** and **Random1k** each select 1,000 scenarios from the full
+Waymo Open Motion Dataset (WOMD) validation set. They are separate from the
+10,000-scene medium training subset.
 
-- [pufferlib/resources/splits/interactive1k.csv](pufferlib/resources/splits/interactive1k.csv)
-- [pufferlib/resources/splits/random1k.csv](pufferlib/resources/splits/random1k.csv)
+## 1. Obtain the full validation inputs
 
-Each manifest references 1000 scenarios from the WOMD validation set. The pipeline below produces a directory of binary scenario files matching one of these manifests, ready to be consumed by the evaluation harness.
+Download the authorized WOMD validation **scenario TFRecords** from the
+[Waymo Open Dataset](https://waymo.com/open/data/motion/). Prepare a corresponding
+GPUDrive-style JSON for every validation scenario using
+[ScenarioMax](https://github.com/valeoai/ScenarioMax), following its conversion
+instructions and the upstream BehaviorBench guide.
 
----
+Both inputs are needed: JSONs provide trajectories and map geometry; raw
+TFRecords provide lane connectivity. The prebuilt GPUDrive collection contains
+only a subset of WOMD validation data and cannot substitute for the complete
+validation inputs required by the upstream manifests.
 
-## Step 1 — Waymo JSONs → Validation Binaries
+Expected layout:
 
-The full WOMD validation set is converted into PufferDrive binaries with lane connectivity. The pipeline takes two inputs side by side:
-
-- **Raw Waymo TFRecords** — needed only for lane connectivity extraction. Available from the [Waymo Open Motion Dataset](https://waymo.com/open/data/motion/) (registration required) under `uncompressed/scenario/{training,validation,testing}/`.
-- **GPUDrive-style JSON scenarios** — one JSON per scenario, used to build the binary trajectories and road graph.
-
-### 1a. Obtaining the GPUDrive JSONs
-
-To reproduce the benchmark you need a GPUDrive-style JSON for **every** scenario in the WOMD validation set. Generate them from the raw Waymo TFRecords using [ScenarioMax](https://github.com/valeoai/ScenarioMax), which converts WOMD (and nuPlan, Argoverse, …) into the GPUDrive JSON format:
-
-```bash
-git clone https://github.com/valeoai/ScenarioMax.git
-cd ScenarioMax
-pip install -e .
-
-# Convert WOMD TFRecords → GPUDrive JSONs (see ScenarioMax docs for full options)
-python -m scenariomax.convert \
-  --source waymo \
-  --input /path/to/waymo/uncompressed/scenario \
-  --output /path/to/gpudrive \
-  --format gpudrive
+```text
+$APEX_WORKSPACE/datasets/
+  waymo-raw/validation/             # WOMD scenario TFRecords
+  waymo-full-json/validation/       # one GPUDrive-style JSON per scenario
 ```
 
-> The pre-built [`EMERGE-lab/GPUDrive`](https://huggingface.co/datasets/EMERGE-lab/GPUDrive) HuggingFace dataset (downloadable via [data_utils/womd/download_womd_data.py](data_utils/womd/download_womd_data.py)) is only a subset of WOMD and **does not cover the full validation set** — it cannot be used to reproduce Interactive1k / Random1k. Use ScenarioMax for the benchmark.
+Preserve the upstream scenario naming and conversion order: the manifests refer
+to the original `map_NNNNNN.bin` filenames from the full validation conversion.
 
-### 1b. JSONs → Binaries
+## 2. Extract connectivity and generate binaries
 
-Run [data_utils/womd/create_training_binaries.py](data_utils/womd/create_training_binaries.py) to extract lane connectivity from the TFRecords, enrich the JSONs, and convert to `.bin` files:
+Run the main pipeline in `apex-train`; `--tf-python` selects `apex-data` for the
+TensorFlow/Waymo subprocesses:
 
 ```bash
+source scripts/apex_env.sh train
 python data_utils/womd/create_training_binaries.py \
-  --tfrecord-root /path/to/waymo \
-  --json-root /path/to/gpudrive \
-  --enriched-root /path/to/gpudrive_with_connectivity \
-  --output-root /path/to/binaries \
-  --workers 80
+  --tf-python "$APEX_WORKSPACE/envs/apex-data/bin/python" \
+  --tfrecord-root "$APEX_WORKSPACE/datasets/waymo-raw" \
+  --json-root "$APEX_WORKSPACE/datasets/waymo-full-json" \
+  --enriched-root "$APEX_WORKSPACE/datasets/waymo-connectivity-json" \
+  --output-root "$DRIVE_BINARIES_DATA_ROOT" \
+  --splits validation --workers 4
 ```
 
-Expected input layout:
+The pipeline extracts lane connectivity, enriches the JSONs, and writes binaries
+to `$DRIVE_BINARIES_DATA_ROOT/validation`. If JSONs already include the required
+connectivity, the JSON-to-binary conversion can be run directly with
+`process_all_maps()` from `pufferlib/ocean/drive/drive.py`, as described upstream.
 
-```
-/path/to/waymo/{training,validation,testing}/      # raw Waymo TFRecords
-/path/to/gpudrive/{training,validation,testing}/   # GPUDrive JSONs (Option A or B)
-```
+## 3. Apply the benchmark manifests
 
-Output:
+The original manifests are checked in at:
 
-```
-/path/to/binaries/validation/
-  map_000000.bin
-  map_000001.bin
-  ...
-```
-
-The filenames here (`map_NNNNNN.bin`) are the `original_filename` values referenced by the split manifests.
-
-> If you already have GPUDrive JSONs with lane connectivity baked in and only need the JSON → binary step, use `process_all_maps()` from [pufferlib/ocean/drive/drive.py](pufferlib/ocean/drive/drive.py) directly.
-
----
-
-## Step 2 — Validation Binaries → Benchmark Split
-
-Use [scripts/remap_files.py](scripts/remap_files.py) together with one of the manifest CSVs to create a split.
+- `pufferlib/resources/splits/interactive1k.csv`
+- `pufferlib/resources/splits/random1k.csv`
 
 ```bash
-python scripts/remap_files.py \
-  --source-path /path/to/binaries/validation \
-  --csv-path    pufferlib/resources/splits/interactive1k.csv \
-  --target-path /path/to/test_eval
+for split in interactive1k random1k; do
+  python scripts/remap_files.py \
+    --source-path "$DRIVE_BINARIES_DATA_ROOT/validation" \
+    --csv-path "pufferlib/resources/splits/$split.csv" \
+    --target-path "$DRIVE_BINARIES_DATA_ROOT"
+done
 ```
 
-The script:
+The script copies each manifest-selected original file to its new benchmark
+filename and preserves the CSV as `manifest.csv`. Confirm **1,000 copied maps and
+zero missing sources** for each split before evaluation.
 
-1. Reads `interactive1k.csv` (columns: `new_filename, original_filename, ego_agent_idx, interactivity_score, map_id`).
-2. For each row, copies `<source-path>/<original_filename>` to `<target-path>/<csv_stem>/<new_filename>`.
-3. Copies the CSV itself to the output directory as `manifest.csv`.
-
-Resulting layout:
-
-```
-/path/to/test_eval/interactive1k/
-  map_000000.bin       # was map_032035.bin in the full validation set
-  map_000001.bin       # was map_005373.bin
-  ...
-  map_000999.bin
-  manifest.csv
+```text
+$DRIVE_BINARIES_DATA_ROOT/
+  training/                        # independent 10,000-scene training set
+  validation/                      # full validation conversion
+  interactive1k/                   # 1,000 maps + manifest.csv
+  random1k/                        # 1,000 maps + manifest.csv
 ```
 
-For the random split, swap in `random1k.csv` — the output directory will be named after the CSV stem (`random1k/`).
-
----
-
-## Using the Split in Evaluation
-
-Once the split directory exists, point `DRIVE_BINARIES_DATA_ROOT` at its parent and run:
+## 4. Evaluate
 
 ```bash
-export DRIVE_BINARIES_DATA_ROOT=/path/to/test_eval
-
 python pufferlib/ocean/benchmark/eval.py \
-  --eval.split interactive1k --map-ids all
+  --eval.split interactive1k --map-ids all \
+  --planner.type ppo \
+  --planner.ppo.weights-path weights/apex_focal_seed42_4b.pt \
+  --traffic.type idm
 ```
 
-The split name passed to `--eval.split` must match the directory name produced in Step 2 (i.e. the CSV stem).
+Repeat with `--eval.split random1k`. See [EVALUATION.md](EVALUATION.md) for traffic
+controllers and metrics. Use the same traffic checkpoints across policy
+comparisons, and keep the held-out validation data distinct from training.
