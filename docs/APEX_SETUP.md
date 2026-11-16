@@ -67,35 +67,13 @@ The medium JSON-to-binary step uses the training environment. Raw Waymo utilitie
 use the data environment. The validation pipeline can invoke the latter through
 `--tf-python`, as shown in [BENCHMARK.md](../BENCHMARK.md).
 
-## Training configurations
+## Training and benchmark
 
-- `drive_apex_medium.ini`: 10k, view-cap APEX configuration with first-exposure
-  population feedback by default.
-- `drive_try1_mix_ppo.ini`: historical Gaussian population path with different
-  checked-in first-exposure/view defaults.
-- `drive_population_main.ini`: separate uniform/fixed/adaptive anchored-mixture
-  experiments.
+APEX and PPO share the training data, binary-conversion pipeline and evaluation
+splits described above. [TRAINING.md](../TRAINING.md) contains their launch
+commands, aligned hyperparameters and checkpoint handling. APEX uses
+`first_episode` feedback by default; the optional `legacy_window` feedback and
+its episode weighting are described in the same document.
 
-## Population feedback modes
-
-The default `population_reward_mode = first_episode` uses only the focal agents'
-first-episode value-return differences after sampling a new population descriptor.
-The two driving policies continue learning through later episodes in the window.
-This mode follows the manuscript's first-exposure objective and centering analysis.
-
-For a denser feedback signal across repeated interactions, select
-`population_reward_mode = legacy_window`. It accumulates per-episode value-return
-differences within a descriptor's map window, weighted by episode start time.
-`population_episode_decay = 0.8` emphasizes earlier episodes; this parameter is
-ignored by `first_episode`. This is an optional multi-exposure training objective.
-Enable it by appending the following overrides to the training command:
-
-```text
---train.population-reward-mode legacy_window --train.population-episode-decay 0.8
-```
-
-The provided `apex_focal_seed42_4b.pt` contains focal-policy weights from the
-multi-exposure variant reported in the manuscript. The simplified filename does
-not change its parameters or training provenance. A complete training resume also
-needs the traffic-policy and optimizer state. See [TRAINING.md](../TRAINING.md)
-and [EVALUATION.md](../EVALUATION.md).
+Use [BENCHMARK.md](../BENCHMARK.md) to prepare the common held-out validation
+splits and [EVALUATION.md](../EVALUATION.md) for planner and traffic settings.

@@ -1,223 +1,206 @@
-# PufferRL Training
+# APEX and PPO baseline training
 
-PufferDrive uses PufferLib for reinforcement learning training with Proximal Policy Optimization (PPO). This document covers training, evaluation, configuration, observation space, and sweep functionality.
+APEX and the PPO baseline share the WOMD medium data, simulator, focal-policy
+architecture, driving reward and benchmark. APEX adds a separately trained
+behavior-conditioned traffic policy and a population constructor. The default
+APEX feedback mode is `first_episode`.
 
----
+## Shared data and evaluation
 
-## Basic Training
+Use [APEX_SETUP.md](docs/APEX_SETUP.md) for installation and the common
+10,000-scene medium training-data preparation. Both methods read
+`$DRIVE_BINARIES_DATA_ROOT/training`. Prepare the held-out WOMD validation data
+and Interactive1k / Random1k splits once using [BENCHMARK.md](BENCHMARK.md);
+both methods use those same files and manifests.
 
-Train a PufferDrive agent from scratch:
+The commands below use 20 validation maps for training-time evaluation.
+Place them under `$DRIVE_BINARIES_DATA_ROOT/validation` before training.
+Final comparisons use all 1,000 scenes in each benchmark split, one fixed
+focal checkpoint per method, and the same traffic controllers and metric
+settings. See [EVALUATION.md](EVALUATION.md).
+
+## Start training
+
+Run from the repository root and select an available GPU with
+`CUDA_VISIBLE_DEVICES`. Configuration precedence is command line, selected
+INI, then `pufferlib/config/default.ini`.
 
 ```bash
-puffer train puffer_drive
+source scripts/apex_env.sh train
+
+# Common medium-data, reproducibility and validation settings.
+common=(
+  --train.seed 42
+  --train.reproducibility True
+  --env.num-maps 10000
+  --vec.num-envs 16 --vec.num-workers 16
+  --eval.split validation --eval.num-maps 20
+  --eval.wosac-realism-eval False --eval.human-replay-eval False
+)
+
+# APEX: 4B total agent steps, nominally 2B per driving policy.
+puffer train puffer_drive \
+  --config pufferlib/config/ocean/drive_apex_medium.ini \
+  "${common[@]}" \
+  --train.name apex_medium \
+  --train.data-dir "$APEX_WORKSPACE/runs/apex_medium" \
+  --train.population-monitor-dir "$APEX_WORKSPACE/runs/apex_medium/population"
+
+# PPO baseline: 2B agent steps for one policy.
+puffer train puffer_drive \
+  --config pufferlib/config/ocean/drive.ini \
+  "${common[@]}" \
+  --train.name ppo_baseline_medium \
+  --train.data-dir "$APEX_WORKSPACE/runs/ppo_baseline_medium"
 ```
 
-Override any config parameter from the command line:
+Choose a new output directory for each independent run. The activation script
+keeps environments, caches, temporary files and outputs under `APEX_WORKSPACE`.
+`reproducibility=True` seeds the Python/NumPy/PyTorch paths and enables
+reproducible Drive/vector execution; it requires a C binding exporting
+`SEEDED_SHARED=1`. The supplied build includes that support.
 
-```bash
-puffer train puffer_drive --train.learning-rate 0.001
-```
+## Driving-policy parameter alignment
 
-Resume training from a saved checkpoint:
+These values are the effective settings of the commands above. APEX-specific
+values come from `drive_apex_medium.ini`; PPO uses `drive.ini` with the shared
+CLI overrides. Both inherit the optimizer and precision from `default.ini`.
 
-```bash
-puffer train puffer_drive --load-model-path experiments/puffer_drive_20240101/model.pt
-```
-
-Run evaluation with a trained model (no training, inference only):
-
-```bash
-puffer eval puffer_drive --load-model-path model.pt
-```
-
----
-
-## Configuration
-
-PufferDrive uses a two-level INI config system. The base defaults are defined in one file, and drive-specific overrides are layered on top.
-
-### Config Files
-
-- `pufferlib/config/default.ini` - Base defaults shared across all PufferLib environments.
-- `pufferlib/config/ocean/drive.ini` - PufferDrive-specific overrides for environment, training, policy, and vectorization parameters.
-
-Command-line arguments override both config files. The precedence order is: command-line > drive.ini > default.ini.
-
-### Environment Parameters `[env]`
-
-These control the driving simulation itself.
-
-| Parameter | Default | Description |
+| Parameter | PPO baseline | APEX |
 |---|---|---|
-| `num_agents` | 1024 | Number of agents simulated in parallel across all maps |
-| `action_type` | continuous | Action space type (continuous or discrete) |
-| `dynamics_model` | classic | Vehicle dynamics model used for stepping |
-| `dt` | 0.1 | Simulation timestep in seconds |
-| `episode_length` | 91 | Number of steps per episode |
-| `num_maps` | 80000 | Number of scenario maps loaded for training |
-| `split` | training | Which data split to use (training, validation, testing) |
-| `init_steps` | 0 | Number of initial warmup steps before training begins |
-| `control_mode` | control_vehicles | What entities the policy controls |
-| `init_mode` | create_all_valid | How agents are initialized in scenarios |
+| Training scenarios / split | 10,000 / training | Same |
+| Seed / reproducibility | 42 / True | Same |
+| Policies | One shared `Drive` | Focal `Drive` + traffic `DriveBehaviorConditioned` |
+| Policy allocation | 100% shared policy | 50% focal / 50% traffic, stratified |
+| Total agent steps | 2,000,000,000 | 4,000,000,000 |
+| Agent steps per driving policy | 2B | Approximately 2B each |
+| Rollout batch, `train.batch_size` | 524,288 | 1,048,576 combined; 524,288 per policy |
+| `minibatch_size` / `max_minibatch_size` | 32,768 / 32,768 | Same, separately for each policy |
+| `update_epochs` | 1 | 1 per policy |
+| Optimizer steps per rollout | 16 | 16 per policy (`mix_ppo_policy_update_steps=16,16`) |
+| `bptt_horizon` | 32 | Same |
+| Encoder embedding / hidden size | 64 / 256 | Same for both policies |
+| Recurrent model | LSTM, input 256 / hidden 256 | Separate LSTM per policy, same dimensions |
+| `optimizer` / `learning_rate` | Muon / 0.003 | Independent Muon optimizer per policy / 0.003 |
+| `adam_beta1`, `adam_beta2`, `adam_eps` | 0.9, 0.999, 1e-8 | Same; these config keys are also passed to Muon |
+| `anneal_lr` | True, cosine schedule | Same, independently per policy |
+| `gamma` / `gae_lambda` | 0.98 / 0.95 | Same |
+| `clip_coef` / `vf_clip_coef` | 0.2 / 0.2 | Same |
+| `vf_coef` / `ent_coef` | 2.0 / 0.005 | Same |
+| `max_grad_norm` | 1.0 | Same |
+| `prio_alpha` / `prio_beta0` | 0.85 / 0.85 | Same |
+| `vtrace_rho_clip` / `vtrace_c_clip` | 1.0 / 1.0 | Same |
+| Precision / compilation | float32 / `compile=False` | Same |
+| Checkpoint / evaluation interval | 1,000 trainer updates | Same |
+| Warm start / opponent pool | None / disabled | Same |
 
-### Reward Parameters `[env]`
+An agent step is one agent transition, summed across the vector environments.
+The APEX total includes both driving policies. Stratified sampling keeps each
+policy's rollout size and optimization budget aligned with the single-policy
+baseline.
 
-| Parameter | Default | Description |
-|---|---|---|
-| `reward_vehicle_collision` | -0.5 | Penalty applied when ego collides with another vehicle |
-| `reward_offroad_collision` | -0.5 | Penalty applied when ego drives off the road |
-| `reward_goal` | 1.0 | Reward for reaching the goal position |
-| `goal_behavior` | 3 | Goal handling mode (controls what happens at goal) |
-| `goal_radius` | 2.0 | Distance threshold in meters to consider goal reached |
-| `collision_behavior` | 2 | What happens on vehicle collision (e.g., stop, continue) |
-| `offroad_behavior` | 2 | What happens on offroad collision |
+### Shared simulator and focal reward
 
-### PPO Training Parameters `[train]`
+| Parameter | Value for both methods |
+|---|---|
+| `vec.num_envs` / `vec.num_workers` / `vec.batch_size` | 16 / 16 / 4 |
+| `env.num_agents` | 1,024 agent slots per vector environment |
+| Dynamics / actions | Classic bicycle / 91 discrete actions (7 acceleration x 13 steering) |
+| `dt` / `episode_length` / `resample_frequency` | 0.1 s / 91 steps / 910 steps |
+| `control_mode` / `init_mode` / `init_steps` | control_vehicles / create_all_valid / 0 |
+| `collision_shrink` | 0.7 |
+| `reward_vehicle_collision` / `reward_offroad_collision` | -0.5 / -0.5 |
+| `reward_goal` / `reward_goal_post_respawn` | 1.0 / 0.25 |
+| `reward_l_align_vel` | 0.5 |
+| Other configured driving-reward coefficients | 0 |
+| `goal_radius` / `goal_speed` / `goal_target_distance` | 2 m / 100 / 30 m |
+| `goal_behavior` / `collision_behavior` / `offroad_behavior` | 3 (remove) / 2 (remove) / 2 (remove) |
+| `termination_mode` | 1 (all agents done) |
+| Training-time scripted traffic | Disabled: `mix_traffic=False`, `idm_others=False` |
 
-| Parameter | Default | Description |
-|---|---|---|
-| `total_timesteps` | 2000000000 | Total environment steps for the entire training run (2 billion) |
-| `learning_rate` | 0.003 | PPO learning rate |
-| `batch_size` | 524288 | Number of transitions per PPO update |
-| `minibatch_size` | 32768 | Minibatch size for gradient updates within each PPO epoch |
-| `bptt_horizon` | 32 | Backpropagation-through-time horizon for LSTM unrolling |
-| `gamma` | 0.98 | Discount factor for future rewards |
-| `gae_lambda` | 0.95 | GAE lambda for advantage estimation |
-| `clip_coef` | 0.2 | PPO clipping coefficient |
-| `vf_coef` | 2.0 | Value function loss coefficient |
-| `ent_coef` | 0.005 | Entropy bonus coefficient (encourages exploration) |
-| `optimizer` | muon | Optimizer choice (muon is a momentum-based optimizer) |
-| `checkpoint_interval` | 1000 | Save a checkpoint every N PPO updates |
+`num_envs=16` is the total number of vector environments, with one per worker
+at these settings. `vec.batch_size=4` is the number received in a vector batch.
+Together they allocate 16,384 agent slots.
 
-### Vectorization Parameters `[vec]`
+The classic base observation has 1,151 floats: 7 ego features, 31 partners x 8
+features and 128 road segments x 7 features. APEX appends six condition values:
+the traffic policy uses them and masks partner observations according to its
+sampled perception conditions; the focal `Drive` policy uses the base features.
 
-| Parameter | Default | Description |
-|---|---|---|
-| `num_workers` | 16 | Number of parallel environment worker processes |
-| `num_envs` | 16 | Number of environments per worker |
+## APEX population constructor
 
-Total parallel environments = `num_workers` x `num_envs` = 256 by default. Each environment runs `num_agents` agents, so the effective parallelism is 256 x 1024 = 262,144 agents.
+The traffic condition contains four reward coordinates and two perception
+coordinates. A 12-dimensional Gaussian latent descriptor parameterizes six
+Beta distributions. A new descriptor is sampled per simulator subenvironment
+for each 910-step population window.
 
-### Policy Parameters `[policy]`
+| Parameter | Value |
+|---|---|
+| `behavior_conditioning` / `behavior_conditioned_policy_id` | True / 1 (traffic) |
+| Radius sampling / maximum | continuous / 50 m; sampled radius in [20, 50] m |
+| View sampling / maximum | discrete_caps / 360 degrees; caps 90, 180, 270, 360 degrees |
+| `population_adversary` | True |
+| `population_reward_mode` / `population_gamma` | first_episode / 0.98 |
+| `population_epsilon` | 0.02 |
+| `population_rho_min` / `population_rho_max` | 0.02 / 0.5 |
+| `population_std_start` / `population_std_end` | 0.5 / 0.2 |
+| `population_std_decay_samples` | 600,000 descriptor records |
+| `population_batch_size` | 256 minimum records per constructor update |
+| `population_minibatch_size` / `population_update_epochs` | 64 / 4 |
+| `population_clip_coef` / `population_target_kl` | 0.2 / 0.03 |
+| Optimizer / `population_learning_rate` | Adam / 0.0003 |
+| `population_max_grad_norm` | 1.0 |
 
-| Parameter | Default | Description |
-|---|---|---|
-| `input_size` | 64 | Dimensionality of the input embedding layer |
-| `hidden_size` | 256 | Hidden size of the LSTM and MLP layers |
+### Feedback modes
 
----
+**first_episode (default).** For each new descriptor, the constructor uses the
+first focal episode group's mean critic-centered signal:
+`V_start - G_bootstrapped`. Returns use discount 0.98; time-limit truncations
+include the continuation value. Later episodes in the same window continue
+training both driving policies. The constructor centers and standardizes its
+record batch before the clipped population-policy update.
 
-## Observation Space
+**legacy_window (optional).** Accumulate the critic-centered signals from
+successive episode groups in the same descriptor window. An episode group
+starting at `start_step` receives weight
+`population_episode_decay ** (start_step / episode_length)`.
+The default decay 0.8 emphasizes earlier episodes. This gives the constructor
+feedback from repeated interactions under the same descriptor.
 
-Each agent receives a flat observation vector of **1120 floats**, structured as follows:
+Append these options to the APEX command to select it:
 
-### Ego Features (7 floats)
-
-Information about the agent's own state:
-
-- Position relative to goal (x, y offsets)
-- Speed (scalar)
-- Heading angle
-- Current steering angle
-- Current acceleration
-
-### Partner Features (217 floats)
-
-Information about other nearby agents (7 features per agent, up to 31 agents):
-
-- Relative position (x, y)
-- Relative speed
-- Relative heading
-- Size information
-- Additional state features
-
-Agents beyond the 31-agent limit are not observed. If fewer than 31 partners exist, the remaining slots are zero-padded.
-
-### Road Features (896 floats)
-
-Information about nearby road segments (7 features per segment, up to 128 segments):
-
-- Segment position relative to ego (x, y)
-- Segment orientation
-- Lane type / boundary information
-- Additional road geometry features
-
-Road segments beyond 128 are not included. If fewer than 128 segments are nearby, the remaining slots are zero-padded.
-
----
-
-## Hyperparameter Sweeps
-
-PufferLib supports built-in sweep functionality for hyperparameter search:
-
-```bash
-puffer sweep puffer_drive
+```text
+--train.population-reward-mode legacy_window --train.population-episode-decay 0.8
 ```
 
-This launches multiple training runs with varied hyperparameters. Sweep configurations can be customized in the config files or via command-line overrides.
+`population_episode_decay` applies to `legacy_window`. Population records and
+update summaries are written to the `population-monitor-dir` set above.
+The PPO baseline has no population constructor.
 
-To sweep over specific parameters, you can define sweep ranges in the config or pass them explicitly. Refer to PufferLib's sweep documentation for details on defining custom sweep spaces.
+## Checkpoints and continuation
 
----
+Training saves `model_puffer_drive_NNNNNN.pt`. APEX also saves
+`model_policy_0_puffer_drive_NNNNNN.pt` (focal),
+`model_policy_1_puffer_drive_NNNNNN.pt` (traffic), and a combined `mix_model`.
+The suffix is the trainer update counter. The provided evaluation files are
+`weights/apex_focal_medium_epoch3815.pt` and
+`weights/ppo_baseline_medium_epoch3815.pt`.
 
-## Evaluation Modes
+To initialize a policy from weights, use `--load-model-path`. For full training
+continuation, retain the complete run directory, `trainer_state.pt`, both APEX
+policy checkpoints and optimizer state; the exported focal file is used for
+standalone evaluation.
 
-PufferDrive supports several evaluation modes beyond standard policy rollouts.
+## Training entry points
 
-### Standard Evaluation
+| Entry point | Configuration and use |
+|---|---|
+| Explicit APEX command above | `drive_apex_medium.ini`: first_episode, 10k maps, 360-degree view caps |
+| Explicit PPO command above | `drive.ini` with `--env.num-maps 10000` and common validation/reproducibility overrides |
+| `scripts/slurm/start_try1_mix_ppo.sh` | Selects `drive_try1_mix_ppo.ini`: 79,000 maps, 180-degree maximum view, continuous view sampling by default; accepts CLI overrides |
+| `scripts/slurm/run_train.sh` | Cluster-specific Slurm wrapper around `puffer train`; takes config and overrides through `"$@"` |
+| `scripts/population/main_train.sh` | Separate uniform/fixed/adaptive population experiments using `drive_population_main.ini` |
 
-Run the trained policy in the environment and collect metrics (collision rate, goal completion, offroad rate):
-
-```bash
-puffer eval puffer_drive --load-model-path model.pt
-```
-
-### WOSAC Realism Evaluation
-
-Evaluate the policy using the Waymo Open Sim Agents Challenge (WOSAC) realism metrics. This measures how realistic the generated trajectories are compared to human driving:
-
-```bash
-puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path model.pt
-```
-
-WOSAC evaluation computes metrics such as kinematic feasibility, map compliance, collision avoidance, and trajectory realism against logged human trajectories.
-
-### Human Replay Evaluation
-
-Compare the policy's behavior against recorded human driving trajectories. This mode replays human actions and measures divergence:
-
-```bash
-puffer eval puffer_drive --eval.human-replay-eval True --load-model-path model.pt
-```
-
-This is useful for measuring the gap between learned and expert driving behavior on the same scenarios.
-
----
-
-## Tips and Common Workflows
-
-**Start with a small run to verify setup:**
-
-```bash
-puffer train puffer_drive --train.total-timesteps 1000000 --env.num-maps 100
-```
-
-This trains for 1M steps on 100 maps, which completes quickly and verifies that data loading, training, and checkpointing all work.
-
-**Monitor training with WandB:**
-
-PufferLib integrates with Weights & Biases for experiment tracking. Training metrics (reward, loss, collision rate) are logged automatically if WandB is configured.
-
-**Adjust parallelism for your hardware:**
-
-On a machine with fewer CPU cores, reduce `num_workers`. On machines with less GPU memory, reduce `batch_size` and `minibatch_size` proportionally:
-
-```bash
-puffer train puffer_drive --vec.num-workers 4 --vec.num-envs 4 --train.batch-size 131072 --train.minibatch-size 8192
-```
-
-**Train on a specific data subset:**
-
-```bash
-puffer train puffer_drive --env.split validation --env.num-maps 1000
-```
+For the medium APEX/PPO comparison, use the explicit commands above. They select
+the data count, reproducibility settings, validation split and APEX monitoring
+directory directly.

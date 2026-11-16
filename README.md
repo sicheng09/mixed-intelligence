@@ -122,39 +122,29 @@ split-generation commands. The final directories are
 
 ## Training
 
-The manuscript-oriented configuration is
-[`drive_apex_medium.ini`](pufferlib/config/ocean/drive_apex_medium.ini): two recurrent
-drivers, seed 42, four billion total agent steps, 910-step population windows,
-continuous perception radius in [20, 50] m, and view caps of 90/180/270/360 degrees.
-The default uses **first-exposure feedback**: for each newly sampled population
-descriptor, the constructor compares the focal critic's initial value estimate
-with the focal agents' first-episode discounted returns. Later episodes continue
-to train the driving policies.
+APEX and the PPO baseline use the same medium training data, simulator and
+benchmark. APEX trains two recurrent driving policies with a 50:50 allocation:
+4B total agent steps give approximately 2B steps per policy, matching the PPO
+baseline's 2B-step budget.
+
+APEX uses `first_episode` population feedback by default: the constructor uses
+the first focal episode's critic-centered return after each descriptor is
+sampled. Both driving policies continue learning throughout the population
+window. The optional `legacy_window` mode accumulates feedback over repeated
+episodes; see [training parameters and feedback modes](TRAINING.md).
 
 ```bash
 source scripts/apex_env.sh train
-CUDA_VISIBLE_DEVICES=0 puffer train puffer_drive \
+puffer train puffer_drive \
   --config pufferlib/config/ocean/drive_apex_medium.ini \
-  --train.data-dir "$APEX_WORKSPACE/runs/apex_seed42"
+  --train.name apex_medium --train.reproducibility True --eval.split validation \
+  --train.data-dir "$APEX_WORKSPACE/runs/apex_medium" \
+  --train.population-monitor-dir "$APEX_WORKSPACE/runs/apex_medium/population"
 ```
 
-Select a GPU allocated to your job. Focal and traffic policy checkpoints are saved
-separately.
-
-For richer feedback from repeated interactions, an optional **multi-exposure
-feedback extension** accumulates per-episode critic-centered signals over the same
-population window, with a temporal decay that emphasizes earlier episodes. Add
-these options to the training command to enable it:
-
-```text
---train.population-reward-mode legacy_window --train.population-episode-decay 0.8
-```
-
-This extension uses a window-level objective; the manuscript's first-exposure
-centering analysis applies to the default `first_episode` mode. See
-[setup notes](docs/APEX_SETUP.md) for the two feedback modes and
-[TRAINING.md](TRAINING.md) for PPO training. Additional population experiments and
-historical configurations remain under `scripts/population/`.
+Select an available GPU with `CUDA_VISIBLE_DEVICES` and prepare the validation
+binaries before training. [TRAINING.md](TRAINING.md) gives both launch commands,
+the aligned PPO/APEX hyperparameters, checkpoint handling and training entry points.
 
 ## Evaluation
 
@@ -165,7 +155,7 @@ source scripts/apex_env.sh train
 CUDA_VISIBLE_DEVICES=0 python pufferlib/ocean/benchmark/eval.py \
   --eval.split interactive1k --map-ids all \
   --planner.type ppo \
-  --planner.ppo.weights-path weights/apex_focal_seed42_4b.pt \
+  --planner.ppo.weights-path weights/apex_focal_medium_epoch3815.pt \
   --traffic.type idm
 ```
 
@@ -175,20 +165,20 @@ traffic-controller checkpoints fixed across focal-policy comparisons.
 
 | Checkpoint | Role |
 |---|---|
-| `apex_focal_seed42_4b.pt` | APEX focal policy, view-cap / multi-exposure variant |
+| `apex_focal_medium_epoch3815.pt` | APEX focal policy, ~2B focal agent steps / 4B total |
 | `conditioned_ppo.pt` | Upstream reward-conditioned traffic policy |
+| `ppo_baseline_medium_epoch3815.pt` | Self-trained PPO baseline, 2B agent steps ([training](TRAINING.md)) |
+| `smart_1m_medium_epoch030.pt` | Self-trained SMART 1M baseline, epoch 030 ([training](PREDICTION.md)) |
 
-The listed checkpoints are under `weights/`. The supplied APEX checkpoint and
-manuscript results above use the optional multi-exposure feedback variant; the
-default configuration for new training runs uses first-exposure feedback. PPO
-self-play and SMART pretrained weights can be obtained from the upstream projects
-when needed for baseline or traffic-controller evaluation.
+The listed checkpoints are under `weights/`. See [TRAINING.md](TRAINING.md)
+for APEX/PPO training and [PREDICTION.md](PREDICTION.md) for SMART. Fixed PPO and
+SMART traffic-controller checkpoints can be obtained from the upstream projects.
 
 ## Further documentation
 
 - [Environment setup](docs/APEX_SETUP.md)
 - [Validation benchmark preparation](BENCHMARK.md)
-- [PPO training](TRAINING.md)
+- [APEX and PPO training](TRAINING.md)
 - [Planner evaluation](EVALUATION.md)
 - [SMART prediction](PREDICTION.md)
 
