@@ -5,7 +5,7 @@ of a separately trained traffic population. This repository builds on
 [BehaviorBench](https://github.com/boschresearch/behavior-bench) and
 [PufferDrive](https://github.com/Emerge-Lab/PufferDrive).
 
-[![APEX overview: conventional self-play, adaptive behavior populations, and closed-loop policy and population updates](docs/assets/introduction.jpg)](docs/assets/introduction.jpg)
+[![APEX overview: conventional self-play, adaptive behavior populations, and closed-loop policy and population updates](docs/assets/introduction.png)](docs/assets/introduction.png)
 
 *Overview of APEX. A focal policy and a behavior-conditioned traffic policy learn
 through interaction, while a population constructor adapts which self-interested
